@@ -1,252 +1,274 @@
 # Mini-Kube Project
 
-This project aims to demystify Docker and Kubernetes by building them from scratch. It includes:
+This project aims to demystify Docker and Kubernetes by building them from scratch. It provides a hands-on approach to understanding the fundamental Linux kernel concepts that power containerization and orchestration. By building simplified versions of `runc` (container runtime) and Kubernetes (orchestrator), we explore the low-level mechanics that often remain hidden behind high-level tools.
 
-1. A Container Runtime (`my-runc`) - A simplified version of runc that implements containerization features
-2. An Orchestrator (`my-kube`) - A simplified version of Kubernetes that manages containers
+## Part 1: `my-runc` - The Container Runtime
 
-## Project Structure
+`my-runc` is our simplified implementation of `runc`, the OCI (Open Container Initiative) compliant runtime that Docker and other container platforms use to spawn and manage containers. It focuses on demonstrating three core Linux kernel features essential for container isolation and resource management: Namespaces, Control Groups (cgroups), and `pivot_root`.
 
+### Core Concepts Explained: The Building Blocks of Containers
+
+To understand `my-runc`, we first need to grasp the foundational Linux kernel features it leverages. We will explain these concepts assuming zero prior knowledge of operating systems, diving deep into their mechanisms and how they contribute to containerization.
+
+#### 1. Linux Kernel Namespaces: The Isolation Mechanism
+
+**What are Namespaces?**
+
+In Linux, namespaces are a powerful feature that partitions global system resources such that processes within a namespace see an isolated instance of that resource. Imagine a large apartment building (the host system). Each apartment (a container) has its own set of amenities (process IDs, network interfaces, file system mounts, etc.), even though they all exist within the same physical building. Namespaces provide this "apartment" view to processes, preventing them from seeing or interfering with the resources of other "apartments" or the building management (the host system).
+
+**How do Namespaces Work?**
+
+When a new process is created, it inherits the namespaces of its parent. To create a container, we essentially tell the kernel to create new, isolated namespaces for the child process. This is achieved primarily through two Linux system calls: `unshare()` and `clone()`.
+
+*   **`unshare(CLONE_NEW* flags)`:** This syscall allows a process to disassociate parts of its execution context (like namespaces) from its parent. For example, `unshare(CLONE_NEWPID)` tells the kernel to move the calling process into a new PID namespace.
+*   **`clone(CLONE_NEW* flags, ...)`:** This syscall creates a new child process, similar to `fork()`, but with more control. By passing `CLONE_NEW*` flags, we can specify which new namespaces the child process should be created within. Our `my-runc` uses `clone()` implicitly via `os/exec.Cmd.SysProcAttr.Cloneflags` to create the child process in new namespaces.
+
+Let's explore the specific namespace types implemented in `my-runc`:
+
+*   **PID Namespace (`CLONE_NEWPID`): Process ID Isolation**
+    *   **What it does:** Isolates the process ID (PID) space. Inside a PID namespace, processes are assigned PIDs starting from 1, independent of the host's PID numbering. The first process in a new PID namespace gets PID 1, just like `init` or `systemd` on the host. This process becomes the "init" for that namespace and handles orphaned processes.
+    *   **Why it's crucial for containers:** Without PID isolation, a process inside a container might see and potentially kill host processes, or its PIDs would conflict with host PIDs, making process management impossible. PID 1 inside the container is critical for proper process supervision.
+
+*   **Mount Namespace (`CLONE_NEWNS`): Isolated Filesystem Views**
+    *   **What it does:** Isolates the list of mount points seen by processes. Each mount namespace has its own view of the filesystem hierarchy. Changes to mount points (e.g., mounting a new filesystem, unmounting) within one mount namespace are not visible in others.
+    *   **Why it's crucial for containers:** This is fundamental for providing a container with its own isolated root filesystem, preventing it from accessing or modifying the host's filesystem directly. This is often combined with `pivot_root`.
+
+*   **UTS Namespace (`CLONE_NEWUTS`): Isolated Hostname and Domainname**
+    *   **What it does:** Isolates the hostname and NIS (Network Information Service) domain name. Processes in different UTS namespaces can have different hostnames.
+    *   **Why it's crucial for containers:** Allows each container to have its own identity on the network (e.g., its own hostname) without affecting the host or other containers.
+
+*   **IPC Namespace (`CLONE_NEWIPC`): Isolated Inter-Process Communication**
+    *   **What it does:** Isolates inter-process communication (IPC) resources such as System V IPC objects (message queues, semaphores, shared memory segments) and POSIX message queues.
+    *   **Why it's crucial for containers:** Prevents processes in one container from interfering with IPC mechanisms used by other containers or the host, ensuring communication isolation.
+
+*   **Network Namespace (`CLONE_NEWNET`): Isolated Network Stack**
+    *   **What it does:** Provides an isolated network stack. This includes its own network devices (e.g., `lo`, `eth0`), IP addresses, routing tables, firewall rules, and port numbers.
+    *   **Why it's crucial for containers:** Each container can have its own virtual network interface, IP address, and port mappings, making it appear as a separate machine on the network. This allows multiple containers to run on the same host and bind to the same port numbers (e.g., port 80) without conflict.
+
+*   **User Namespace (`CLONE_NEWUSER`): Isolated User and Group IDs**
+    *   **What it does:** Isolates the user and group ID (UID/GID) space. This allows a process to have root privileges (UID 0) inside the container while being mapped to an unprivileged UID on the host.
+    *   **Why it's crucial for containers:** A critical security feature. It enables processes within a container to run as `root` for administrative tasks without actually having `root` privileges on the host system, significantly reducing the security blast radius if a container is compromised. Our `my-runc` uses UID/GID mapping to achieve this.
+
+#### 2. Linux Control Groups (cgroups): Resource Management
+
+**What are cgroups?**
+
+Control Groups (cgroups) are a Linux kernel feature that allows for the allocation, prioritization, and management of system resources (CPU, memory, disk I/O, network) among groups of processes. While namespaces isolate *what* a process can see, cgroups control *how much* resources a process (or a group of processes) can use.
+
+**How do cgroups Work? (Architecture)**
+
+Cgroups are organized hierarchically, similar to a filesystem. The kernel exposes a virtual filesystem (typically mounted at `/sys/fs/cgroup`) where directories represent cgroups and special files within those directories allow administrators to configure resource limits.
+
+*   **Hierarchy:** Cgroups form a tree structure. A child cgroup can further subdivide the resources allocated to its parent.
+*   **Subsystems:** Different resource types (CPU, memory, blkio, net_cls, etc.) are managed by different "subsystems."
+
+**Versioning: Cgroups v1 vs. Cgroups v2**
+
+Modern Linux kernels have moved to **Cgroups v2**, which offers a unified hierarchy for all resource controllers, unlike v1 which had separate hierarchies for memory, cpu, etc. `my-runc` is robust enough to detect and handle both versions.
+
+*   **Cgroups v1 Strategy:**
+    *   Checks for directory `/sys/fs/cgroup/memory`.
+    *   Creates a new cgroup directory: `/sys/fs/cgroup/memory/my-container`.
+    *   **Enabling:** Writes the process PID to `cgroup.procs`.
+    *   **Limiting:** Writes the limit in bytes to `memory.limit_in_bytes`.
+
+*   **Cgroups v2 Strategy:**
+    *   Checks for the unified hierarchy at `/sys/fs/cgroup` (where `memory.max` exists).
+    *   Creates a new cgroup directory: `/sys/fs/cgroup/my-container`.
+    *   **Enabling:** Writes the process PID to `cgroup.procs`.
+    *   **Limiting:** Writes the limit in bytes to `memory.max`.
+
+**Implementation Details (`setupCgroups`):**
+Our implementation in `namespace_linux.go` dynamically detects the cgroup version by checking for the existence of the `memory` controller directory. This ensures `my-runc` works on both older systems and modern distributions like Ubuntu 22.04+ (used in Lima VMs).
+
+#### 3. Root Filesystem Isolation (`pivot_root`): Changing the Container's View of the World
+
+**What is `pivot_root`?**
+
+`pivot_root` is a Linux system call that changes the root filesystem of the current process and all its children. Unlike `chroot()`, which only changes the root directory for a process and its children but doesn't fully detach the process from the old root filesystem, `pivot_root()` completely moves the current process's root from the old root to a new directory. The old root is then typically unmounted and becomes inaccessible to the process.
+
+**The `pivot_root` Dance (Detailed Implementation):**
+
+Performing `pivot_root` correctly requires a specific sequence of operations to satisfy kernel requirements (specifically, that the new root must be a mount point separate from the old root).
+
+1.  **Prepare the New Root Location:** We create a temporary directory `/tmp/my-runc-root` to serve as the staging area for our new root.
+2.  **Bind Mount the Root Filesystem:** We perform a bind mount of the desired root filesystem (in our simple case, the host's `/`) onto `/tmp/my-runc-root`. This effectively clones the filesystem view into that directory.
+    *   `syscall.Mount(rootfs, newRoot, "", syscall.MS_BIND|syscall.MS_REC, "")`
+3.  **Make it Private:** We mark this new mount as "private". This ensures that mount events within this new namespace don't propagate back to the host namespace.
+    *   `syscall.Mount(newRoot, newRoot, "", syscall.MS_PRIVATE|syscall.MS_REC, "")`
+4.  **Prepare the "Old Root" Holding Area:** We create a directory inside our new root, e.g., `/tmp/my-runc-root/.pivot_root`, to temporarily hold the old filesystem.
+5.  **Execute `pivot_root`:** We call the syscall.
+    *   `syscall.PivotRoot(newRoot, putOld)`
+    *   At this exact moment, `/tmp/my-runc-root` becomes `/`. The old `/` is moved to `/.pivot_root`.
+6.  **Switch Working Directory:** The process is technically still "standing" in the old directory structure. We explicitly `os.Chdir("/")` to move into the top of the new root.
+7.  **Unmount the Old Root:** We unmount `/.pivot_root` to sever the link to the host completely.
+    *   `syscall.Unmount("/.pivot_root", syscall.MNT_DETACH)`
+8.  **Mount `/proc`:** This is a critical final step. Process tools like `ps` rely on the `/proc` filesystem to list running processes. If we don't mount a fresh version of `/proc` inside our new root, `ps` will either fail or show the *host's* process list (breaking the illusion of isolation). We mount a new `proc` filesystem instance, which will only contain PIDs visible within our new PID namespace.
+
+### `my-runc` Architecture and Execution Flow
+
+`my-runc` is designed with a parent-child process model to achieve containerization.
+
+#### The `run` Command (Parent Process)
+
+When you execute `my-runc run <command> [args...]`, the initial `my-runc` process acts as the **parent**. Its primary responsibility is to:
+
+1.  Parse the user's command.
+2.  Create a new child process with all the desired Linux namespaces enabled.
+3.  Set up UID/GID mappings for the user namespace.
+4.  Wait for the child process to complete.
+
+**UID/GID Mapping Explained:**
+
+One of the most complex parts of User Namespaces is mapping. We want the user to be `root` (UID 0) inside the container, but a safe, unprivileged user (like UID 1000) outside.
+
+In `run_linux.go`, we define `UidMappings` and `GidMappings` in `syscall.SysProcAttr`:
+
+```go
+UidMappings: []syscall.SysProcIDMap{
+    {
+        ContainerID: 0,           // The UID inside the container (root)
+        HostID:      os.Getuid(), // The UID on the host (current user, e.g., 1000)
+        Size:        1,           // Map only this one ID
+    },
+},
 ```
-mini-kube/
-├── README.md
-└── my-runc/
-    ├── main.go
-    ├── namespace.go
-    ├── namespace_test.go
-    └── Makefile
+
+*   **ContainerID: 0:** This tells the kernel "Inside the new namespace, this user is 0 (root)."
+*   **HostID: os.Getuid():** This tells the kernel "On the host, this maps to the actual user running the program."
+*   **Result:** When the child process starts, it thinks it is running as root. It can perform operations that require root *within the bounds of its namespace* (like mounting /proc), but it has no extra privileges on the actual host filesystem.
+
+#### The `child` Command (Child Process)
+
+After the parent process initiates the child with new namespaces, the child process starts executing the `my-runc` binary again, but this time it enters the `child` case in the `main` function's `switch` statement. This `child` process is now isolated within its own set of namespaces. Its responsibilities are:
+
+1.  **`setupCgroups()`**: Detects v1/v2 and applies memory limits (default 100MB).
+2.  **`setupRootFS()`**: Performs the bind-mount, `pivot_root`, and mounts `/proc`.
+3.  **`exec`**: Replaces itself with the user's command (e.g., `bash`).
+
+### Platform-Specific Implementation (Go Build Tags)
+
+Go build tags (also known as build constraints) allow us to include or exclude entire files from a package during compilation based on operating system, architecture, or custom tags. This is crucial for `my-runc` because many of the Linux kernel syscalls (like `pivot_root` or `CLONE_NEW*` flags) are not available or behave differently on other operating systems (e.g., macOS, Windows).
+
+*   **`//go:build linux`:** This tag at the top of a `.go` file means the file will *only* be compiled when the target operating system is Linux.
+*   **`//go:build !linux`:** This tag means the file will be compiled for *any* operating system *except* Linux.
+
+### Usage
+
+To run a command inside a `my-runc` container (on a Linux system):
+
+```bash
+sudo ./my-runc run <command> [args...]
 ```
 
-## Implementation Progress
+**Note:** `my-runc` often requires root privileges to perform syscalls like `unshare`, `pivot_root`, and cgroup manipulations.
 
-### Tasks Completed:
-1. Research and understand Linux kernel concepts: namespaces, cgroups, and pivot_root
-   - Successfully understood the fundamental concepts that underpin containerization
-   - Namespaces provide process isolation (PID, network, mount namespaces)
-   - Cgroups enable resource limiting and accounting (CPU, memory, etc.)
-   - Pivot_root allows changing the root filesystem for isolation
-2. Setup development environment with Go and necessary tools
-   - Installed and configured Go development environment (version 1.24.4 in VM)
-   - Installed necessary system packages including build-essential
-   - Set up proper Go module structure
-3. Install and configure Lima VM
-   - Created Ubuntu VM with proper configuration
-   - Configured VM with sufficient resources (4 CPU cores, 4GB RAM)
-   - Verified that the VM has necessary kernel features for containerization
-4. Create basic Go project structure for my-runc
-   - Created directory structure for my-runc project
-   - Initialized Go module with proper dependencies
-   - Created basic main.go file with command-line interface
-   - Implemented initial build and test capabilities
-5. Implement basic chroot functionality in Go
-   - Created a working executable that can parse command-line arguments
-   - Built and tested the initial my-runc binary successfully
-   - Verified the executable can be run in the VM environment
-6. Implement basic namespace isolation functionality
-   - Created a framework for setting up namespaces (PID, network, mount, user, IPC, UTS)
-   - Implemented structure for cgroup management
-   - Created framework for root filesystem setup
-7. Implement comprehensive testing
-   - Added test files using Go's built-in testing framework
-   - Created Makefile with test automation capabilities
-   - Implemented test-driven development approach
-8. Implement complete namespace functionality for my-runc container runtime
-   - Implemented all required namespace types: PID, network, mount, user, IPC, and UTS
-   - Added complete command-line interface with run, spec, and version commands
-   - Implemented proper error handling for all namespace setup operations
-   - Created extensive test coverage to validate namespace isolation
-   - Added integration tests for end-to-end functionality
+Example: Run `hostname` inside a container. You should see a generic hostname like `my-runc-container` (if set) or the original hostname (if UTS namespace is not fully utilized) different from your host's hostname.
 
-### What We've Learned and Implemented:
+```bash
+sudo ./my-runc run hostname
+```
 
-#### Understanding Namespaces:
-Namespaces are a Linux kernel feature that provides process isolation. Each namespace creates a separate view of the system for processes within it. The key namespace types we've implemented include:
+Example: Run a memory-intensive Python script to test cgroups. This should fail with an OOM (Out Of Memory) error if the memory limit is exceeded.
 
-- **PID namespaces** - Isolate process ID spaces, so processes in different namespaces have different PID values
-- **Network namespaces** - Provide separate network interfaces and IP addresses
-- **Mount namespaces** - Create separate filesystem views with isolated mount points
-- **User namespaces** - Isolate user ID spaces, allowing mapping between host and container UIDs/GIDs
-- **IPC namespaces** - Isolate inter-process communication resources (shared memory, message queues)
-- **UTS namespaces** - Isolate hostname and domainname
+```bash
+sudo ./my-runc run python -c 'import time; x = bytearray(200000000); time.sleep(1)'
+```
+(Requires Python to be installed in the root filesystem used by the container)
 
-#### Understanding Process ID (PID):
-In Linux, a PID (Process Identifier) is a unique number assigned to each process. In containerization, PID namespaces isolate processes so that each container has its own PID space, which allows for process management without conflicts between containers and the host system.
+### Building
 
-#### Understanding Network Isolation:
-Network namespaces create isolated network environments for containers. This includes separate network interfaces, routing tables, IP addresses, and firewall rules. This ensures that containers cannot directly communicate with each other or with the host unless explicitly configured to do so.
+To build the `my-runc` binary, navigate to the `my-runc` directory and run:
 
-#### Understanding runc:
-runc is the standard container runtime for Docker and other container platforms. It's a lightweight, portable container runtime that implements the Open Container Initiative (OCI) specification. Our `my-runc` is a simplified implementation of runc's core functionality, demonstrating how containers are created and managed at the kernel level.
+```bash
+go build -o my-runc .
+```
 
-#### Testing Approach:
-We've implemented comprehensive testing using Go's built-in testing framework with:
-- Unit tests for each namespace function
-- Integration tests for end-to-end functionality
-- Tests that validate command-line parsing and execution
-- Tests that verify all namespace types are properly handled
-- Test-driven development approach where tests guide implementation
+### Testing
 
-#### Commands We've Run:
-We've successfully tested the following commands:
-- `make build` - Builds the my-runc binary
-- `make test` - Runs all tests with verbose output
-- `go test -v` - Runs tests with verbose output
-- `go build -o my-runc .` - Builds the binary manually
-- `./my-runc` - Shows usage information
-- `./my-runc version` - Displays version information
-- `./my-runc run echo` - Executes a command in a containerized environment
+Comprehensive testing is crucial to ensure the correctness and robustness of `my-runc`, especially when dealing with low-level kernel interactions. We employ a strategy that combines unit tests for different platforms.
 
-### Next Steps:
-1. Add namespace isolation using syscall.CLONE_NEWPID, CLONE_NEWNS, CLONE_NEWNET
-   - Implement process isolation with PID, network, and mount namespaces
-   - Test namespace isolation functionality
-2. Implement cgroups setup to limit RAM and CPU
-   - Create cgroup management functions
-   - Implement resource limits for containers
-   - Test resource limiting functionality
-3. Implement pivot_root functionality
-   - Implement root filesystem changes for container isolation
-   - Test filesystem isolation
-4. Create test cases to verify container isolation
-   - Develop automated tests for isolation features
-   - Validate that containers are properly isolated
-5. Implement basic my-kube orchestrator API server
-   - Create API server to accept pod specifications
-   - Implement basic pod scheduling
-6. Create simple scheduler logic for pod placement
-   - Implement basic scheduling algorithm
-   - Test with multiple pods
-7. Implement kubelet that calls my-runc to start processes
-   - Create kubelet that manages container lifecycle
-   - Integrate with my-runc for actual container execution
-8. Design pod specification format
-   - Define structure for pod specifications
-   - Create validation for pod configurations
-9. Implement pod lifecycle management (create, start, stop)
-   - Implement full pod lifecycle management
-   - Add monitoring capabilities
-10. Test the full container orchestration workflow
-    - End-to-end testing of container creation and management
-    - Integration testing of all components
-11. Add monitoring and logging capabilities
-    - Implement logging for container operations
-    - Add monitoring features
-12. Document the implementation and testing process
-    - Create comprehensive documentation
-    - Document design decisions and implementation details
-13. Optimize and refactor code for performance and clarity
-    - Refactor for maintainability
-    - Optimize for performance
-14. Create comprehensive README with usage instructions
-    - Add detailed usage instructions
-    - Document all features and capabilities
-15. Validate all components work together as a complete system
-    - Full system integration testing
-    - Performance and correctness validation
+*   **Unit Tests (`run_test.go` and `run_linux_test.go`):**
+    *   `run_test.go`: Contains tests that verify the behavior of `my-runc` on non-Linux systems. It specifically checks that attempts to run containers on unsupported platforms result in the expected error message and exit code.
+    *   `run_linux_test.go`: Contains tests specifically for Linux systems. These tests verify:
+        *   **Hostname Isolation:** By running `hostname` inside the container and comparing it to the host's hostname, ensuring the UTS namespace is effectively isolating.
+        *   **PID Isolation:** Runs `ps aux` to confirm the container sees itself as PID 1 and cannot see host processes.
+        *   **Filesystem Isolation:** Verifies the `pivot_root` logic by checking if the old root is accessible.
+        *   **Cgroups Memory Limit:** By attempting to allocate more memory than allowed by the cgroup (using an infinite allocation loop), it verifies that the kernel's OOM killer terminates the process as expected.
 
-## Getting Started
+To run the tests, navigate to the `my-runc` directory and execute:
 
-1. Ensure you're running as root in the VM (required for containerization features)
-2. Navigate to the my-runc directory
-3. Build with: `make build` or `go build -o my-runc .`
-4. Run tests with: `make test` or `go test -v`
+```bash
+sudo go test -v ./...
+```
 
-## Current Status
+*   **On non-Linux systems (e.g., macOS):** The `run_linux_test.go` file will be automatically skipped by the Go build system due to the `//go:build linux` tag. Only `run_test.go` (and any other untagged or `!linux` tagged tests) will run, confirming the unsupported behavior.
+*   **On Linux systems:** Both `run_test.go` (if present and relevant, though typically `!linux` tests would be skipped) and `run_linux_test.go` will be executed, validating the actual containerization features. (Note: The `python` command in the cgroups test must be available in the container's root filesystem).
 
-The project is in the early stages of implementation. We have successfully:
-- Set up a proper development environment with Lima VM
-- Created the basic project structure for my-runc
-- Implemented a working command-line interface
-- Built and tested the initial my-runc executable
-- Created a framework for namespace isolation
-- Implemented comprehensive testing with test-driven development approach
-- Implemented complete namespace functionality with all required types
+### Running on macOS (via Lima)
 
-The next phase will involve implementing actual containerization features using Linux kernel capabilities.
+Since macOS uses the Darwin kernel, it does not support Linux namespaces or Cgroups. To develop and run `my-runc` on a Mac, we recommend using `limactl` (Lima) to run a lightweight Linux VM.
 
-## Technical Details
+1.  **Start a Linux VM:** `limactl start ubuntu`
+2.  **Enter the VM:** `limactl shell ubuntu`
+3.  **Copy Code:** Due to read-only filesystem limitations with shared folders, copy the project to a local directory in the VM:
+    ```bash
+    cp -r /path/to/my-runc ~/playground
+    cd ~/playground
+    ```
+4.  **Build and Run:**
+    ```bash
+    go build -o my-runc .
+    sudo ./my-runc run bash
+    ```
 
-### Linux Kernel Features Used
+## Part 2: `my-kube` - The Orchestrator (Work in Progress)
 
-1. **Namespaces** - Isolate processes and their view of the system:
-   - PID namespaces (separate process ID spaces)
-   - Network namespaces (separate network interfaces)
-   - Mount namespaces (separate filesystem views)
-   - User namespaces (separate user ID spaces)
-   - IPC namespaces (separate inter-process communication)
-   - UTS namespaces (separate hostname and domainname)
+We are now building a simplified version of Kubernetes to manage our `my-runc` containers across multiple nodes. We call this the **Mini-Cloud Architecture**.
 
-2. **Cgroups** - Control resource usage:
-   - CPU limiting and accounting
-   - Memory limits and accounting
-   - Process group management
+### The Architecture: "Manager" vs. "Worker"
 
-3. **Pivot_root** - Change root filesystem:
-   - Create isolated filesystem environments
-   - Implement container root filesystem isolation
+To move beyond running single processes on a single machine, we will simulate a cluster using **3 Linux VMs** (managed by `limactl`).
 
-### Design Philosophy
+#### 1. The Control Plane (`my-kube-server`) - The "Manager"
+*   **Location:** Runs on the `master-node` VM.
+*   **Role:** The Brain. It does not run user applications. It manages the state of the cluster.
+*   **Component: API Server (Go):**
+    *   A Go HTTP server listening on port 8080.
+    *   Accepts commands like `POST /pods` to create new work.
+    *   Stores the "Desired State" (e.g., "We need 2 web servers running").
+*   **Component: Scheduler:**
+    *   A loop that assigns "Pending" pods to available Worker Nodes based on RAM availability.
 
-- Follow the Open Container Initiative (OCI) specifications
-- Use minimal dependencies to understand core concepts
-- Focus on correctness and educational value over production features
-- Implement features incrementally with proper testing
+#### 2. The Worker Node (`my-kubelet`) - The "Kitchen"
+*   **Location:** Runs on `worker-node-1` and `worker-node-2`.
+*   **Role:** The Muscle. It executes the work assigned by the Manager.
+*   **Component: Kubelet (Go):**
+    *   An agent that constantly polls the API Server: *"Do you have work for me?"*
+    *   When it receives a job, it calls **`my-runc`** to spin up the container.
+    *   It monitors the container's health and reports back to the Master.
 
-## Development Approach
+#### 3. The Workload (The "App")
+*   **Location:** Inside the containers on Worker Nodes.
+*   **Role:** The actual application useful to the user.
+*   **Implementation (Python HTTP Server):**
+    *   Instead of running `ls` (which exits immediately), we will run a lightweight Python Web Server (`python3 -m http.server`).
+    *   **Goal:** This server will listen on a specific IP address. If we can `curl` this IP from the Master Node and get a response, we have successfully implemented **Cluster Networking**.
 
-This project follows an incremental approach:
-1. Start with basic structure and functionality
-2. Add one containerization feature at a time
-3. Test each feature thoroughly before moving to the next
-4. Document implementation decisions and lessons learned
+### The Networking Challenge
 
-The implementation is focused on understanding how containerization works under the hood, rather than creating a production-ready system.
+This is the most complex part of Part 2. `ls` doesn't need network, but a Web Server does.
+*   **Bridge Networking:** We must implement a virtual network bridge (like `cni0`) on each worker.
+*   **IP Allocation:** Every container needs a unique IP address (e.g., `10.244.1.5`) reachable from other nodes.
 
-## Testing Approach
+### Roadmap
 
-We use a test-driven development approach where:
+1.  **Infrastructure:** Script to spin up 3 connected `limactl` VMs.
+2.  **Networking Upgrade:** Modify `my-runc` to support network namespaces and veth pairs (Bridge Networking).
+3.  **The API Server:** Build the Go server to accept Pod requests.
+4.  **The Kubelet:** Build the agent to poll the server and run containers.
+5.  **Integration:** Deploy a Python Web Server pod and access it via `curl` from a different node.
 
-1. **Tests are written first** - Tests define the expected behavior before implementation
-2. **Tests fail initially** - The tests should fail until we implement the actual functionality
-3. **Tests guide implementation** - Each test shows what needs to be implemented
-4. **Tests validate correctness** - Once implemented, tests verify that functionality works correctly
+## Development Notes
 
-### Current Test Status
-
-The tests currently pass because our implementation is just a placeholder that logs messages instead of performing actual system calls. In a real implementation, these tests would fail and then pass only when the actual Linux kernel functionality (namespaces, cgroups, pivot_root) is properly implemented.
-
-### What Our Tests Would Validate
-
-When fully implemented, the tests would validate:
-- **Namespace creation** - PID, network, mount, user, IPC, and UTS namespaces are created correctly
-- **Resource limiting** - Cgroups properly limit CPU and memory usage
-- **Filesystem isolation** - Root filesystem changes work with pivot_root
-- **User mappings** - Proper UID/GID mapping in user namespaces
-- **Error handling** - Appropriate handling of invalid scenarios
-- **Isolation** - Processes in different namespaces are properly isolated
-
-### Test Commands
-
-All tests can be run with:
-- `make test` - Run all tests with verbose output
-- `go test -v` - Run tests with verbose output
-- `make check` - Run vet check and tests
-
-### Future Test Development
-
-The test files in this project are structured to show the expected implementation. As we implement each feature:
-1. The tests will guide what functionality needs to be implemented
-2. Tests will initially fail (as they should in TDD)
-3. Each implementation step should make tests pass
-4. The tests provide validation that our implementation is correct
-
-## Relation to limactl and VM Environment
-
-This project is designed to run in a Linux environment that has proper containerization capabilities. When you run `limactl shell ubuntu ls -lah` in a separate terminal, you're accessing the Ubuntu VM that we've set up specifically for this project. This VM provides:
-
-- The necessary Linux kernel features for containerization (namespaces, cgroups, etc.)
-- A proper environment where we can test our container runtime implementation
-- The ability to run our `my-runc` binary to create containers
-- The required permissions to set up namespaces and manage processes
-
-The commands we've implemented and tested in this project work directly in this VM environment, allowing us to experiment with containerization concepts while maintaining a controlled and isolated environment.
+This project is developed primarily for educational purposes. Its goal is to provide a deep understanding of containerization and orchestration concepts by building simplified versions of widely used tools. It is not intended for production use, as it lacks robustness, security hardening, and full feature sets found in production-grade runtimes and orchestrators.

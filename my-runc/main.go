@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"os/exec"
 )
 
 func main() {
@@ -21,23 +22,16 @@ func main() {
 			log.Fatal("Usage: my-runc run <command>")
 		}
 		// Parse the command to run
-		commandToRun := os.Args[2]
-		log.Printf("Running command: %s", commandToRun)
+		commandToRun := os.Args[2:]
+		run(commandToRun)
 
-		// Setup namespaces
-		if err := setupNamespaces(); err != nil {
-			log.Fatalf("Failed to setup namespaces: %v", err)
+	case "child":
+		// This is the child process, run inside the new namespaces
+		if len(os.Args) < 3 {
+			log.Fatal("Usage: my-runc child <command>")
 		}
-
-		// Setup user namespace
-		if err := setupUserNamespace(); err != nil {
-			log.Fatalf("Failed to setup user namespace: %v", err)
-		}
-
-		// Setup mount namespace
-		if err := setupMountNamespace(); err != nil {
-			log.Fatalf("Failed to setup mount namespace: %v", err)
-		}
+		commandToRun := os.Args[2:]
+		log.Printf("Running command in child: %s", commandToRun)
 
 		// Setup cgroups
 		if err := setupCgroups(); err != nil {
@@ -49,8 +43,15 @@ func main() {
 			log.Fatalf("Failed to setup root filesystem: %v", err)
 		}
 
-		log.Println("Container setup complete")
-		log.Printf("Running command: %s", commandToRun)
+		// Execute the command
+		cmd := exec.Command(commandToRun[0], commandToRun[1:]...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			log.Fatalf("Failed to run command in container: %v", err)
+		}
 
 	case "spec":
 		// Generate a container spec
@@ -63,7 +64,7 @@ func main() {
 
 	default:
 		log.Printf("Unknown command: %s", command)
-		log.Println("Available commands: run, spec, version")
+		log.Println("Available commands: run, child, spec, version")
 		os.Exit(1)
 	}
 }
