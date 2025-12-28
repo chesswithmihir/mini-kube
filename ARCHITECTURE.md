@@ -1,306 +1,315 @@
-# Mini-Kube Architecture & Internals: A Textbook
+# Mini-Kube Internals: A Deep Dive Textbook
 
 **Author:** Gemini  
 **Date:** December 28, 2025  
-**Target Audience:** Computer Science Engineers & Systems Programmers
+**Version:** 2.0 (Textbook Edition)
+
+---
+
+## Preface
+
+This document is written for computer science engineers, systems programmers, and anyone who wants to understand the "magic" of Kubernetes and Containers by reading the source code of a simplified implementation. 
+
+We will traverse the stack from the **Linux Kernel System Calls** up to the **Distributed Control Loops** of the orchestrator. We will not just explain *what* the code does, but *why* it was written that way, and what operating system principles it leverages.
 
 ---
 
 ## Table of Contents
 
-1.  [Introduction](#1-introduction)
-2.  [Part I: The Kernel & The Runtime (`my-runc`)](#part-i-the-kernel--the-runtime-my-runc)
-    *   [The Container Illusion](#the-container-illusion)
-    *   [The Re-Execution Pattern](#the-re-execution-pattern-solving-the-chicken-and-egg)
-    *   [System Calls & Namespaces (The "Matrix")](#system-calls--namespaces-the-matrix)
-    *   [Filesystem Isolation: `pivot_root` vs `chroot`](#filesystem-isolation-pivot_root-vs-chroot)
-    *   [Control Groups (Cgroups): The Resource Police](#control-groups-cgroups-the-resource-police)
-    *   [Networking: Building a Virtual ISP](#networking-building-a-virtual-isp)
-        *   [Case Study: The NAT & Subnet Debugging Saga](#case-study-the-nat--subnet-debugging-saga)
-3.  [Part II: The Orchestrator (`my-kube`)](#part-ii-the-orchestrator-my-kube)
-    *   [Distributed Systems Theory: Control Plane & Agents](#distributed-systems-theory-control-plane--agents)
-    *   [The API Server: State Management & Concurrency](#the-api-server-state-management--concurrency)
-    *   [The Scheduler: Algorithms & Assignment](#the-scheduler-algorithms--assignment)
-    *   [The Kubelet Agent: The Sync Loop Pattern](#the-kubelet-agent-the-sync-loop-pattern)
-4.  [Part III: End-to-End Request Tracing](#part-iii-end-to-end-request-tracing)
+1.  [Chapter 1: The Container Runtime (`my-runc`)](#chapter-1-the-container-runtime-my-runc)
+    *   [1.1 The Architecture of `main.go`](#11-the-architecture-of-maingo)
+    *   [1.2 The "Re-Execution" Pattern (Fork/Exec/Clone)](#12-the-re-execution-pattern-forkexecclone)
+    *   [1.3 Linux Namespaces: The Isolation Primitives](#13-linux-namespaces-the-isolation-primitives)
+    *   [1.4 The Filesystem: `pivot_root` Deep Dive](#14-the-filesystem-pivot_root-deep-dive)
+    *   [1.5 Control Groups (Cgroups): Resource Management](#15-control-groups-cgroups-resource-management)
+    *   [1.6 Networking: Building the Virtual ISP](#16-networking-building-the-virtual-isp)
+        *   [1.6.1 L2 Switching (The Bridge)](#161-l2-switching-the-bridge)
+        *   [1.6.2 Virtual Cabling (Veth Pairs)](#162-virtual-cabling-veth-pairs)
+        *   [1.6.3 Network Address Translation (NAT) & The Packet Flow](#163-network-address-translation-nat--the-packet-flow)
+2.  [Chapter 2: The Orchestrator (`my-kube`)](#chapter-2-the-orchestrator-my-kube)
+    *   [2.1 Distributed System Design: Hub-and-Spoke](#21-distributed-system-design-hub-and-spoke)
+    *   [2.2 The API Server: Concurrency & State](#22-the-api-server-concurrency--state)
+    *   [2.3 The Scheduler: The Assignment Loop](#23-the-scheduler-the-assignment-loop)
+    *   [2.4 The Kubelet Agent: Edge-Triggered Reconciliation](#24-the-kubelet-agent-edge-triggered-reconciliation)
+3.  [Chapter 3: Critical Debugging Case Studies](#chapter-3-critical-debugging-case-studies)
+    *   [3.1 The "Invalid Gateway" Subnet Error](#31-the-invalid-gateway-subnet-error)
+    *   [3.2 The "Ping 8.8.8.8" Failure (NAT)](#32-the-ping-8888-failure-nat)
 
 ---
 
-## 1. Introduction
+## Chapter 1: The Container Runtime (`my-runc`)
 
-`mini-kube` is an educational implementation of a Container Orchestrator (like Kubernetes) and a Container Runtime (like Docker/Runc). It is built from scratch in Go to demonstrate the low-level operating system primitives that power modern cloud infrastructure.
+The `my-runc` binary is a userspace tool that interacts with the Linux Kernel to create isolated processes. It corresponds to the **OCI (Open Container Initiative)** runtime specification (like `runc`, `crun`).
 
-This document dissects the source code line-by-line, explaining the *why* behind every design decision, algorithm, and system call.
+### 1.1 The Architecture of `main.go`
 
----
+The entry point (`my-runc/main.go`) acts as a CLI dispatcher. It handles two distinct phases of a container's life cycle that are often confused.
 
-## Part I: The Kernel & The Runtime (`my-runc`)
+1.  **`my-runc run` (Phase 1: The Parent)**
+    *   **Context:** Runs in the **Host's** namespaces.
+    *   **Privileges:** Root (via `sudo`).
+    *   **Responsibility:** Talk to the kernel to spawn the child. It does *not* execute the user's command (e.g., `bash`) directly. It sets up the sandbox boundaries.
+    *   **Key Code:** Calls `run()` in `run_linux.go`.
 
-The `my-runc` directory contains the low-level machinery. Its job is to take a command (like `bash`) and run it in an isolated environment.
+2.  **`my-runc child` (Phase 2: The Setup Agent)**
+    *   **Context:** Runs **Inside** the new, empty namespaces.
+    *   **Privileges:** Root (Cap-Admin) *inside* the container context.
+    *   **Responsibility:** "Furnish the room." The walls (namespaces) are up, but the room is empty. It mounts filesystems, sets up Cgroups, and configures the network interface *from the inside*.
+    *   **Key Code:** Calls `setupCgroups()`, `setupRootFS()`, and finally `syscall.Exec()`.
 
-### The Container Illusion
+### 1.2 The "Re-Execution" Pattern (Fork/Exec/Clone)
 
-There is no such thing as a "Linux Container" in the kernel. There are only **Processes** with restricted views. A container is simply a process that has been lied to about:
-1.  **Who it is** (PID Namespace)
-2.  **What it can see** (Mount Namespace)
-3.  **Who its neighbors are** (Network Namespace)
-4.  **What resources it owns** (User Namespace)
-
-### The Re-Execution Pattern: Solving the Chicken and Egg
-
-**File:** `my-runc/main.go`, `my-runc/run_linux.go`
-
-One of the most confusing parts of reading container runtime code is seeing the program call *itself*.
-
+In `run_linux.go`, we see this line:
 ```go
-// my-runc/run_linux.go
 cmd := exec.Command("/proc/self/exe", append([]string{"child"}, commandToRun...)...)
 ```
 
-**Why do we do this?**
-In Linux, you cannot change the PID Namespace of the *currently running* process. It is an immutable property of your birth. If you want a process to be "PID 1" in a new world, you must `fork/clone` a **child** into that new world.
+**Why do we execute `/proc/self/exe`?**
+This is a pointer to the currently running binary (`my-runc`). The parent process is essentially telling the kernel: "I want you to start a new process. Use *my* binary code. But start it with different arguments (`child`)."
 
-However, we can't just run the user's command (e.g., `bash`) immediately as that child. Why?
-1.  We haven't set up the filesystem (Process will see host files).
-2.  We haven't set up Cgroups (Process can eat all RAM).
-3.  We haven't set up Networking.
+**The "Chicken and Egg" Problem of Namespaces:**
+You cannot "enter" a PID namespace that doesn't exist yet. And you cannot change your own PID namespace once you are alive (you already have a PID).
+*   **Solution:** You must specify the namespaces **at the moment of birth**.
+*   This is why we set `SysProcAttr` on the `cmd` object before calling `cmd.Start()`.
 
-**The Solution:**
-1.  **Stage 1 (Parent):** `my-runc run ...`
-    *   Talks to the Kernel.
-    *   Prepares the namespaces flags.
-    *   Clones a child.
-2.  **Stage 2 (Child - Intermediate):** `my-runc child ...`
-    *   Born inside the namespaces.
-    *   Still running Go code (smart).
-    *   Sets up the environment (Mounts, Cgroups).
-    *   Waits for Network handshake.
-3.  **Stage 3 (Child - Final):** `exec("bash")`
-    *   Replaces the Go memory image with the user's program.
-    *   The user's program wakes up inside a fully prepared box.
+### 1.3 Linux Namespaces: The Isolation Primitives
 
-### System Calls & Namespaces (The "Matrix")
-
-**File:** `my-runc/run_linux.go`
-
-The most critical lines of code in the entire project are in the `SysProcAttr` struct. This is the bridge between Go and the Linux `clone()` syscall.
+The Linux Kernel (`kernel/fork.c`) implements `clone()`. We access this via `syscall.SysProcAttr`.
 
 ```go
-cmd.SysProcAttr = &syscall.SysProcAttr{
-    Cloneflags: syscall.CLONE_NEWPID |  // Isolation 1
-                syscall.CLONE_NEWNS  |  // Isolation 2
-                syscall.CLONE_NEWUTS |  // Isolation 3
-                syscall.CLONE_NEWIPC |  // Isolation 4
-                syscall.CLONE_NEWNET |  // Isolation 5
-                syscall.CLONE_NEWUSER,  // Isolation 6
-    
-    // User Namespace Mapping
-    UidMappings: []syscall.SysProcIDMap{
-        {ContainerID: 0, HostID: os.Getuid(), Size: 1},
-    },
-}
+Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | ...
 ```
 
-#### Detailed Breakdown of Flags:
+#### The Big Six Namespaces:
 
-1.  **`CLONE_NEWPID`**:
-    *   **Effect:** The child process becomes **PID 1** inside the new namespace.
-    *   **Implication:** PID 1 is special. It is the "init" process. If PID 1 dies, the whole namespace dies. It is also responsible for reaping zombie processes.
-    *   **Without this:** The process would see its real host PID (e.g., 14002) and could see/kill other host processes.
+1.  **`CLONE_NEWPID` (Process IDs)**
+    *   **Kernel View:** The kernel maintains a mapping. Host PID `14052` maps to Container PID `1`.
+    *   **User View:** Running `ps` inside the container shows PID 1.
+    *   **Why it matters:** Processes inside cannot signal (kill) processes outside because they literally cannot address them. PID `1` (init) also has special responsibilities (reaping zombies).
 
-2.  **`CLONE_NEWNS` (Mount Namespace)**:
-    *   **Effect:** The process gets its own copy of the list of mounted filesystems.
-    *   **Implication:** If the process runs `mount` or `unmount`, it only affects *its* view. This is required for `pivot_root` to work without unmounting the user's actual hard drive.
+2.  **`CLONE_NEWNS` (Mounts)**
+    *   **History:** The first namespace (hence just `NEWNS`).
+    *   **Function:** Allows the process to have a private list of mount points.
+    *   **Usage:** We use this to mount a new `/proc` and `pivot_root` to a new filesystem without affecting the host.
 
-3.  **`CLONE_NEWNET` (Network Namespace)**:
-    *   **Effect:** The process gets an empty network stack. No `eth0`, no `wlan0`, just a broken `lo`.
-    *   **Implication:** Total isolation. It cannot access the internet until we physically inject a virtual wire (veth pair) into this namespace.
+3.  **`CLONE_NEWNET` (Networking)**
+    *   **Function:** Gives the process a completely empty network stack.
+    *   **Initial State:** Only a `lo` (Loopback) interface exists, and it is DOWN.
+    *   **Challenge:** The container is deaf and mute. We must "install a cable" (Veth Pair) later.
 
-4.  **`CLONE_NEWUSER` (User Namespace)**:
-    *   **Effect:** Decouples User IDs.
-    *   **The Mapping:** `ContainerID: 0` maps to `HostID: 1000` (You).
-    *   **Security:** Inside the container, the process thinks it is `root` (UID 0). It can modify routing tables, mount filesystems, etc. *But only inside its sandbox*. If it manages to break out to the host, it is instantly treated as UID 1000 (standard user) and blocked from doing damage.
+4.  **`CLONE_NEWUTS` (Unix Timesharing System)**
+    *   **Function:** Allows changing the Hostname and Domain Name.
+    *   **Usage:** `syscall.Sethostname("my-container")`.
 
----
+5.  **`CLONE_NEWIPC` (Inter-Process Communication)**
+    *   **Function:** Isolates Shared Memory segments and Message Queues.
+    *   **Why:** Prevents a container from writing to the shared memory of another container (a common attack vector).
 
-### Filesystem Isolation: `pivot_root` vs `chroot`
+6.  **`CLONE_NEWUSER` (User IDs)**
+    *   **Function:** Maps a user ID inside the container to a different one outside.
+    *   **Code:**
+        ```go
+        UidMappings: []syscall.SysProcIDMap{
+            {ContainerID: 0, HostID: os.Getuid(), Size: 1},
+        }
+        ```
+    *   **Explanation:** "User 0 (Root) inside acts like User 1000 (Mihir) outside." This is a massive security feature. Even if the containerized process breaks out, it finds itself as a regular, non-root user on the host.
 
-**File:** `my-runc/namespace_linux.go` -> `setupRootFS()`
+### 1.4 The Filesystem: `pivot_root` Deep Dive
 
-We use `syscall.PivotRoot`, not `chroot`.
+Most tutorials use `chroot`. We use `pivot_root` because it is secure.
 
-*   **`chroot`**: "Put on blinders." The process technically still stands on the host filesystem, but the kernel checks every path to ensure it starts with `/new/root`. It is insecure; it is possible to break out of a chroot jail.
-*   **`pivot_root`**: "Swap the floor." The kernel unmounts the host filesystem for this process and mounts the new filesystem in its place. The old filesystem is literally gone from the namespace.
+**The Vulnerability of `chroot`:**
+`chroot` (Change Root) merely modifies the pathname lookup algorithm. If a process has a handle to a directory *outside* the jail, it can `chdir("..")` its way out.
 
-**The Algorithm:**
-1.  **Bind Mount New Root:** `mount --bind /tmp/new-root /tmp/new-root`. (Strict kernel requirement: `pivot_root` only works on mount points, not directories).
-2.  **Pivot:** `syscall.PivotRoot("/tmp/new-root", "/tmp/new-root/.pivot_root")`.
-    *   This atomic swap moves the current root to `.pivot_root` and makes `/tmp/new-root` the new `/`.
-3.  **Unmount Old:** `syscall.Unmount("/.pivot_root", MNT_DETACH)`.
-    *   Sever the link to the host.
-4.  **Mount /proc:** `mount -t proc proc /proc`.
-    *   Crucial! Linux tools like `ps`, `top`, and `free` read from `/proc`. If we don't mount a fresh proc filesystem, `ps` will either fail or show the host's process table (breaking the illusion).
+**The `pivot_root` Mechanism (`namespace_linux.go`):**
+This syscall swaps the mount namespace root.
 
----
+1.  **Preparation:** `mkdir /tmp/my-runc-root`. Bind-mount the rootfs here.
+2.  **The Pivot:** `syscall.PivotRoot("/tmp/my-runc-root", "/tmp/my-runc-root/.pivot_root")`.
+    *   **Action:** The Kernel takes the *current* root (`/`) and moves it to `.pivot_root`.
+    *   **Action:** The Kernel takes `/tmp/my-runc-root` and makes it the new `/`.
+3.  **The Unmount:** `syscall.Unmount("/.pivot_root", MNT_DETACH)`.
+    *   This is the mic drop. We unmount the old root. The container now has **no way** to reference the host filesystem. It has vanished.
+4.  **Mounting `/proc`:**
+    *   `syscall.Mount("proc", "/proc", "proc", ...)`
+    *   This mounts the **virtual filesystem** that exposes kernel statistics. Crucially, because we are in a new PID Namespace, this `/proc` only shows information relevant to *this* namespace.
 
-### Control Groups (Cgroups): The Resource Police
+### 1.5 Control Groups (Cgroups): Resource Management
 
-**File:** `my-runc/namespace_linux.go` -> `setupCgroups()`
+**File:** `namespace_linux.go`
 
-Namespaces limit what you **see**. Cgroups limit what you **use**.
+While namespaces provide **Isolation** (Visibility), Cgroups provide **Accounting and Limits** (Usage).
 
-**The Filesystem Interface:**
-The kernel exposes cgroups as a file system at `/sys/fs/cgroup`. We don't need a library; we just write to files.
+**The Hierarchy:**
+Cgroups are implemented as a **Virtual File System (VFS)**, typically mounted at `/sys/fs/cgroup`.
+
+**Mechanism:**
+1.  **Directory Creation:** `mkdir /sys/fs/cgroup/memory/my-container`.
+    *   The kernel automatically populates this directory with control files (`memory.limit_in_bytes`, `cgroup.procs`, etc.).
+2.  **Enrolling:** We write our own PID (`os.Getpid()`) into `cgroup.procs`.
+    *   "Kernel, please count my resource usage in this bucket."
+3.  **Limiting:** We write `100000000` (100MB) into `memory.limit_in_bytes`.
+    *   "Kernel, if this bucket exceeds 100MB, kill the processes inside."
 
 **V1 vs V2:**
-*   **Legacy (V1):** Resources are split (`/sys/fs/cgroup/memory`, `/sys/fs/cgroup/cpu`).
-*   **Modern (V2):** Unified hierarchy (`/sys/fs/cgroup`).
+Linux is transitioning to Cgroups V2 (Unified Hierarchy). Our code in `setupCgroups` detects the version:
+*   **V1:** Separate hierarchies (`/sys/fs/cgroup/memory`, `/sys/fs/cgroup/cpu`).
+*   **V2:** Single hierarchy (`/sys/fs/cgroup`). Memory limit file is named `memory.max`.
 
-**Our Implementation:**
-1.  **Detect:** Check if `/sys/fs/cgroup/memory` exists.
-2.  **Create Group:** `mkdir /sys/fs/cgroup/my-container`.
-3.  **Assign Process:** Write `os.Getpid()` to `/sys/fs/cgroup/my-container/cgroup.procs`.
-4.  **Limit Memory:** Write `100000000` (100MB) to `memory.max` (V2) or `memory.limit_in_bytes` (V1).
+### 1.6 Networking: Building the Virtual ISP
 
-If the process exceeds 100MB, the kernel's **OOM Killer** (Out of Memory Killer) will target this specific cgroup and terminate the process.
+This section explains `network_linux.go`. We built a Layer 2/3 network from scratch.
 
----
+#### 1.6.1 L2 Switching (The Bridge)
 
-### Networking: Building a Virtual ISP
+We create a bridge named `my-bridge0`.
+```bash
+ip link add name my-bridge0 type bridge
+ip addr add 10.244.0.1/16 dev my-bridge0
+ip link set my-bridge0 up
+```
+*   **Concept:** A software bridge acts exactly like a physical network switch. It maintains a MAC address table and forwards Ethernet frames between ports.
+*   **Gateway:** We assign `10.244.0.1` to the bridge itself. This becomes the "Default Gateway" for all containers.
 
-**File:** `my-runc/network_linux.go`
+#### 1.6.2 Virtual Cabling (Veth Pairs)
 
-This is the most complex part of the runtime. We manually constructed a TCP/IP network stack.
+A **Veth Pair** is a pipe for network packets. What goes in one end comes out the other.
+```bash
+ip link add veth-host type veth peer name veth-container
+```
+1.  **Host End (`veth-host`):** We plug this into the bridge (`ip link set veth-host master my-bridge0`).
+2.  **Container End (`veth-container`):** This starts on the host. We must **move** it into the container's namespace.
+    ```go
+    // network_linux.go
+    exec.Command("ip", "link", "set", "veth-container", "netns", <Container_PID>)
+    ```
+    Once moved, the interface disappears from the host (`ip link show` won't see it) and appears inside the container.
 
-#### The Physical Analogy
-*   **The Bridge (`my-bridge0`):** A physical Network Switch plugged into the wall (Host).
-*   **The Veth Pair:** An Ethernet cable with two ends.
-*   **The Namespace:** A locked room where the computer (Container) sits.
+#### 1.6.3 Network Address Translation (NAT) & The Packet Flow
 
-#### The Algorithm (`setupNetwork`)
-1.  **Create Bridge:** `ip link add my-bridge0 type bridge`.
-2.  **Create Cable:** `ip link add veth1234 type veth peer name veth-c1234`.
-    *   Now we have a cable lying on the floor of the host.
-3.  **Plug into Switch:** `ip link set veth1234 master my-bridge0`.
-4.  **Throw Cable into Room:** `ip link set veth-c1234 netns <PID>`.
-    *   This is the magic. One end of the virtual cable disappears from the host and appears inside the container's isolated network namespace.
-5.  **Rename & Configure:**
-    *   Inside the container (via `nsenter`): Rename `veth-c1234` to `eth0`.
-    *   Assign IP: `10.244.0.100/16`.
-    *   Route: `ip route add default via 10.244.0.1` (The Bridge IP).
+When the container (`10.244.0.100`) pings Google (`8.8.8.8`), the packet flow is:
 
-#### Case Study: The NAT & Subnet Debugging Saga
-
-During development, we encountered two critical networking failures.
-
-**Failure 1: The Missing Subnet Mask**
-*   **Symptom:** The container (`10.244.0.100`) could not ping the gateway (`10.244.0.1`). Error: `Nexthop has invalid gateway`.
-*   **Root Cause:** We assigned the IP as `10.244.0.100` (implied `/32`).
-    *   In IP routing, `/32` means "This IP is the only thing in the network."
-    *   The container looked at its routing table: "I need to reach `10.244.0.1`. My mask is `/32`. That IP is outside my network. I have no way to reach it."
-*   **Fix:** We appended `/16` (`10.244.0.100/16`).
-    *   Now the container says: "My network covers `10.244.0.0` to `10.244.255.255`. The gateway `10.244.0.1` is my neighbor. I can talk to it directly via ARP."
-
-**Failure 2: The Packet Loss (No NAT)**
-*   **Symptom:** Container could ping Gateway, but `ping 8.8.8.8` failed with 100% packet loss.
-*   **Root Cause:**
-    1.  Container sends packet: `Src: 10.244.0.100` -> `Dst: 8.8.8.8`.
-    2.  Host forwards packet to Internet.
-    3.  Google receives packet.
-    4.  Google tries to reply to `10.244.0.100`.
-    5.  **FAILURE:** `10.x.x.x` is a private, non-routable IP address. Core internet routers drop packets destined for private ranges. Google had no idea who sent it.
-*   **Fix:** **IP Masquerading (NAT)**.
-    *   Command: `iptables -t nat -A POSTROUTING -s 10.244.0.0/16 -j MASQUERADE`.
-    *   **Logic:** As the packet leaves the Host VM, the kernel **rewrites the Source IP** from `10.244.0.100` to the Host's Public IP (e.g., `192.168.5.2`).
+1.  **Routing Decision (Container):**
+    *   Dest: `8.8.8.8`.
+    *   Routing Table: `default via 10.244.0.1 dev eth0`.
+    *   Action: Send to Gateway (Bridge).
+2.  **Switching (Bridge):**
+    *   Bridge receives frame. Passes it up to the Host Kernel IP stack.
+3.  **Routing Decision (Host):**
+    *   Dest: `8.8.8.8`.
+    *   Routing Table: `default via 192.168.5.1 dev eth0` (The VM's gateway).
+4.  **The NAT Problem:**
+    *   The packet source is `10.244.0.100`. This is a private IP.
+    *   If sent as-is, Google will try to reply to `10.244.0.100`. The internet routers will drop this.
+5.  **The NAT Solution (IP Masquerade):**
+    *   We added an `iptables` rule:
+        ```bash
+        iptables -t nat -A POSTROUTING -s 10.244.0.0/16 -j MASQUERADE
+        ```
+    *   **Action:** The Host Kernel replaces `Src: 10.244.0.100` with `Src: 192.168.5.2` (The VM's public IP). It saves this mapping in a conntrack table.
+6.  **Return Trip:**
     *   Google replies to `192.168.5.2`.
-    *   The Host Kernel remembers the connection, rewrites the destination back to `10.244.0.100`, and forwards it to the container.
+    *   Host Kernel checks conntrack, sees the mapping, rewrites Dest to `10.244.0.100`, and forwards to the bridge.
 
 ---
 
-## Part II: The Orchestrator (`my-kube`)
+## Chapter 2: The Orchestrator (`my-kube`)
 
-`my-kube` operates at a higher abstraction level. It doesn't care about syscalls; it cares about **State**.
+`my-kube` is a simplified version of the Kubernetes Control Plane and Kubelet. It demonstrates **Declarative State Management**.
 
-### Distributed Systems Theory: Control Plane & Agents
+### 2.1 Distributed System Design: Hub-and-Spoke
 
-We use a **Hub-and-Spoke** architecture.
-*   **Hub (Server):** The source of truth. It stores the "Desired State" (What the user wants).
-*   **Spoke (Agent):** The reconciler. It compares "Desired State" vs "Actual State" and takes action.
+*   **API Server (Hub):** Stateless (mostly), holds the "Desired State".
+*   **Kubelet (Spoke/Agent):** Autonomous. Polls the Hub. Actively drives "Actual State" to match "Desired State".
 
-### The API Server: State Management & Concurrency
+### 2.2 The API Server: Concurrency & State
 
 **File:** `my-kube/pkg/server/store.go`
 
-We implemented an in-memory Key-Value store.
+We implemented an in-memory database to replace Etcd.
 
-**Concurrency Control:**
-Since Go's HTTP server handles each request in a separate Goroutine, multiple agents could try to register at the exact same time.
-*   **Problem:** Race conditions writing to the `map`.
-*   **Solution:** `sync.RWMutex`.
-    *   `Lock()`: Exclusive lock for writing (Adding a Pod). No one else can read or write.
-    *   `RLock()`: Shared lock for reading (Listing Pods). Multiple readers allowed, but no writers.
+**The Concurrency Challenge:**
+In Go, `http.ListenAndServe` spawns a goroutine for every request. If Agent A sends a Heartbeat and Agent B reports a status simultaneously, they might write to the `map` at the same time. Go maps are **not** thread-safe.
 
-**File:** `my-kube/pkg/server/handler.go`
+**The Solution: `sync.RWMutex`**
+We use a **Read-Write Mutex**.
+*   **`Lock()` (Write Lock):** Used when Adding/Updating Pods. Only one goroutine can hold this. All others block.
+*   **`RLock()` (Read Lock):** Used when Listing Pods. Multiple goroutines can hold this simultaneously. Efficient for high-read workloads (like agents polling).
 
-We built a REST API.
-*   `POST /pods`: Submit a job.
-*   `GET /nodes/{id}/pods`: The "Inbox" for a worker node.
+**REST API Design (`handler.go`):**
+*   `POST /pods`: User submits a job.
+*   `GET /nodes/{node_id}/pods`: The crucial endpoint. This is how the Server communicates with the Agent without dialing it directly. This allows Agents to be behind NATs or Firewalls.
 
-**Design Decision: Polling vs Pushing**
-*   We chose **Polling** (Agent asks Server) instead of Pushing (Server calls Agent).
-*   **Why?**
-    *   If Agent is behind a firewall (NAT), Server can't connect to it.
-    *   If Server goes down, Agent keeps running (decoupled).
-    *   This is exactly how Kubernetes works.
+### 2.3 The Scheduler: The Assignment Loop
 
-### The Scheduler: Algorithms & Assignment
+**File:** `my-kube/server/main.go`
 
-**File:** `my-kube/server/main.go` -> `runScheduler()`
+The scheduler is a background loop (a `goroutine`) separate from the HTTP handlers.
 
-The Scheduler is an infinite loop running in the background of the Server.
+**Logic:**
+1.  **Poll:** Every 5 seconds, scan the Store.
+2.  **Filter:** Find Pods where `Status == Pending` AND `NodeID == ""`.
+3.  **Select:** Find available Nodes.
+4.  **Bind:** Assign `Pod.NodeID = Node.ID`.
 
-**The Algorithm:**
-1.  Acquire Lock (Read State).
-2.  Find all Pods where `Status == Pending` AND `NodeID == ""`.
-3.  Find all Nodes.
-4.  **Decision Logic:**
-    *   Current Implementation: **Round Robin / First Available**. Pick `nodes[0]`.
-    *   Real Kubernetes: Complex scoring (CPU capacity, Taints/Tolerations, Affinity).
-5.  **Bind:** Update the Pod's `NodeID` in the store.
+**Comparison to K8s:**
+*   **Our Scheduler:** Blind Round-Robin.
+*   **K8s Scheduler:** Multi-stage filtering (Predicates) and Scoring (Priorities). Checks CPU/Mem request vs Node Capacity, Taints, Tolerations, Affinity.
 
-### The Kubelet Agent: The Sync Loop Pattern
+### 2.4 The Kubelet Agent: Edge-Triggered Reconciliation
 
 **File:** `my-kube/agent/agent.go`
 
-The Agent is a state machine. It does not just "receive commands". It **Synchronizes**.
+The Agent is the "Muscle". It wraps the "Brain" (`my-runc`).
 
-**The Loop:**
-1.  **Get Desired State:** `GET /nodes/{my-id}/pods`. Server says: "You should be running [Pod A, Pod B]".
-2.  **Get Actual State:** Agent checks internal map `knownPods`. "I am running [Pod A]".
-3.  **Diff:** "I am missing Pod B."
-4.  **Reconcile:** Call `runtime.RunPod(Pod B)`.
-5.  **Update Cache:** Add Pod B to `knownPods`.
+**The Sync Loop (`sync()`):**
+1.  **Download Desired State:** Fetch list of Pods assigned to me.
+2.  **Check Local State:** What am I currently running? (In our simple version, we track this in a `knownPods` map. In reality, we would query the Docker Daemon/CRI).
+3.  **Reconcile:**
+    *   If in Desired but not Local -> `runtime.RunPod()`.
+    *   (Future) If in Local but not Desired -> `runtime.StopPod()`.
 
-This loop runs every 5 seconds. If a pod crashes (Actual State changes), the next loop will see it's missing (or stopped) and restart it. This creates a **Self-Healing System**.
+This is **Level-Triggered** logic (mostly). We check the *state*, not just events. If the server crashes and comes back, the next poll syncs everything correctly.
 
 ---
 
-## Part III: End-to-End Request Tracing
+## Chapter 3: Critical Debugging Case Studies
 
-Let's trace the life of a request: `curl -X POST -d '{"command": ["python", "server.py"]}' localhost:8080/pods`
+These are real issues encountered during the development of this project.
 
-1.  **User** hits API Server.
-2.  **API Server** decodes JSON, acquires `Mutex.Lock()`, writes Pod to `MemoryStore` with Status `Pending`.
-3.  **Scheduler Loop** wakes up. Sees Pending Pod. Sees Worker Node `worker-1`.
-4.  **Scheduler** updates Pod in Store: `NodeID = "worker-1"`.
-5.  **Agent (worker-1)** wakes up (5s poll). Calls `GET /nodes/worker-1/pods`.
-6.  **Agent** receives JSON containing the Pod.
-7.  **Agent** calls `Runtime.RunPod()`.
-8.  **Runtime (`my-runc`)** is executed via `os/exec`.
-9.  **`my-runc` (Parent)** calls `clone(CLONE_NEWPID | ...)` to create Child.
-10. **`my-runc` (Parent)** sets up Bridge and Veth pair (`setupNetwork`).
-11. **`my-runc` (Child)** sets up Cgroups (Limit RAM) and Pivot Root (Secure Filesystem).
-12. **`my-runc` (Child)** calls `exec("python server.py")`.
-13. **Kernel** starts Python process as PID 1 inside the isolated namespace.
+### 3.1 The "Invalid Gateway" Subnet Error
 
-The system is now live.
+**Error:**
+```text
+Error: Nexthop has invalid gateway.
+```
+
+**Scenario:**
+We configured the container IP as `10.244.0.100` and the Gateway as `10.244.0.1`.
+
+**The Root Cause:**
+When you configure an IP without a subnet mask (CIDR) in Linux `ip` command, it defaults to `/32` (255.255.255.255).
+*   **Container View:** "My IP is 10.244.0.100. My network size is 1 address. Everyone else is an alien."
+*   **Action:** Container tries to reach Gateway `10.244.0.1`.
+*   **Check:** "Is `10.244.0.1` in my network?" -> **NO**.
+*   **Result:** "I need a gateway to reach... my gateway." (Recursive failure).
+
+**The Fix:**
+We changed the IP assignment to `10.244.0.100/16`.
+*   **Container View:** "My IP is 10.244.0.100. My network is `10.244.0.0 - 10.244.255.255`."
+*   **Check:** "Is `10.244.0.1` in my network?" -> **YES**.
+*   **Result:** ARP request sent. Connection established.
+
+### 3.2 The "Ping 8.8.8.8" Failure (NAT)
+
+**Scenario:**
+Container could ping the Bridge (`10.244.0.1`) but not Google (`8.8.8.8`). `tcpdump` showed packets leaving the VM but never coming back.
+
+**The Root Cause:**
+We forgot **Network Address Translation (NAT)**.
+The external internet does not route Private RFC1918 addresses (`10.x.x.x`). When the packet reached Google, Google's server saw a Source IP of `10.244.0.100`. It attempted to reply, but its local router dropped the packet as "bogon" (invalid internet traffic).
+
+**The Fix:**
+We enabled **IP Masquerading** on the Host VM.
+This forces the Host VM to replace the packet's source address with its *own* valid LAN address before sending it out. It acts as a proxy for the container.
