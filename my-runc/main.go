@@ -18,12 +18,21 @@ func main() {
 	switch command {
 	case "run":
 		// Run a container with the specified command
-		if len(os.Args) < 3 {
-			log.Fatal("Usage: my-runc run <command>")
+		args := os.Args[2:]
+		var ip string
+		if len(args) > 0 && args[0] == "--ip" {
+			if len(args) < 3 {
+				log.Fatal("Usage: my-runc run --ip <ip> <command>")
+			}
+			ip = args[1]
+			args = args[2:]
+		} else {
+			if len(args) < 1 {
+				log.Fatal("Usage: my-runc run <command>")
+			}
 		}
-		// Parse the command to run
-		commandToRun := os.Args[2:]
-		run(commandToRun)
+
+		run(args, ip)
 
 	case "child":
 		// This is the child process, run inside the new namespaces
@@ -42,6 +51,18 @@ func main() {
 		if err := setupRootFS("/"); err != nil {
 			log.Fatalf("Failed to setup root filesystem: %v", err)
 		}
+
+		// WAIT FOR NETWORK
+		// We expect the parent to pass a pipe at FD 3.
+		// We wait for the parent to write to it (signaling setup is done) or close it.
+		pipe := os.NewFile(3, "pipe")
+		log.Println("Waiting for network setup...")
+		// Reading from the pipe blocks until data is available or the pipe is closed.
+		// We don't care about what data is sent, just the synchronization event.
+		buf := make([]byte, 2)
+		_, _ = pipe.Read(buf)
+		pipe.Close()
+		log.Println("Network setup complete (or skipped). Starting process.")
 
 		// Execute the command
 		cmd := exec.Command(commandToRun[0], commandToRun[1:]...)
