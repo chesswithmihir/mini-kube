@@ -14,6 +14,37 @@ We will traverse the stack from the **Linux Kernel System Calls** up to the **Di
 
 ---
 
+## Chapter 0: Vision, Goal, and Practical Usage
+
+### 0.1 The Goal
+The objective of this project is to build a **production-principled** (though not production-ready) container orchestrator. We are moving away from the "magic" of `docker run` and `kubectl apply` to understand the raw Linux primitives: `clone`, `pivot_root`, `veth` pairs, and `iptables`.
+
+### 0.2 The Vision: Demystifying the Black Box
+We believe that Kubernetes is often treated as a "mysterious cloud engine." This project's vision is to prove that K8s is simply a **Distributed System built on top of File Operations**. By representing Namespaces, Cgroups, and Pod States as files and HTTP requests, we make the complex simple.
+
+### 0.3 Practical Usage: Running the Runtime
+To understand this architecture, you must see it run. `my-runc` is the foundational unit.
+
+**Building the binary:**
+```bash
+cd my-runc && go build -o my-runc .
+```
+
+**Executing an isolated process with Networking:**
+```bash
+# This command:
+# 1. Spawns a new process in a private PID/Net/Mount namespace.
+# 2. Automatically creates 'my-bridge0' on your host.
+# 3. Injects a virtual ethernet cable into the container.
+# 4. Sets up NAT so the container can reach the internet.
+sudo ./my-runc run --ip 10.244.0.100 sh -c "ip addr && ping -c 1 8.8.8.8"
+```
+
+**Example Output:**
+Inside the container, you will see a unique IP `10.244.0.100` and a successful ping to Google. This confirms that your "Mini-ISP" and "Mini-Operating System" are both functioning correctly.
+
+---
+
 ## Table of Contents
 
 1.  [Chapter 1: The Container Runtime (`my-runc`)](#chapter-1-the-container-runtime-my-runc)
