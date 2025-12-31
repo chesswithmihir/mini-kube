@@ -15,11 +15,12 @@
     *   [1.2 Networking: The Virtual Plumbing](#12-networking-the-virtual-plumbing)
     *   [1.3 Distributed Systems: The Orchestration Loop](#13-distributed-systems-the-orchestration-loop)
 3.  [Chapter 2: The Container Runtime (`my-runc`)](#chapter-2-the-container-runtime-my-runc)
-    *   [2.1 The Entry Point: Command Dispatching](#21-the-entry-point-command-dispatching)
-    *   [2.2 The "Re-Execution" Pattern (The Fork/Exec Loop)](#22-the-re-execution-pattern-the-forkexec-loop)
-    *   [2.3 Linux Namespaces: The Six Walls of Isolation](#23-linux-namespaces-the-six-walls-of-isolation)
-    *   [2.4 Filesystem Isolation: `pivot_root` internals](#24-filesystem-isolation-pivot_root-internals)
-    *   [2.5 Control Groups (Cgroups): Resource Metering](#25-control-groups-cgroups-resource-metering)
+    *   [2.1 Initial Invocation: The User's Command](#21-initial-invocation-the-users-command)
+    *   [2.2 Phase 1: The Parent Process - Setting the Stage](#22-phase-1-the-parent-process---setting-the-stage)
+    *   [2.3 Phase 2: The Child Process - Internal Container Setup](#23-phase-2-the-child-process---internal-container-setup)
+    *   [2.4 Linux Namespaces: The Walls of Isolation](#24-linux-namespaces-the-walls-of-isolation)
+    *   [2.5 Filesystem Isolation: `pivot_root` Internals](#25-filesystem-isolation-pivot_root-internals)
+    *   [2.6 Control Groups (Cgroups): Resource Metering](#26-control-groups-cgroups-resource-metering)
 4.  [Chapter 3: The Networking Stack (Building a Mini-ISP)](#chapter-3-the-networking-stack-building-a-mini-isp)
     *   [3.1 Virtual Ethernet (Veth) Pairs](#31-virtual-ethernet-veth-pairs)
     *   [3.2 Layer 2 Switching: The Bridge](#32-layer-2-switching-the-bridge)
@@ -126,217 +127,275 @@ This is the core of Kubernetes.
 
 ---
 
-## Chapter 2: The Container Runtime (`my-runc`)
+## Chapter 2: The Container Runtime (`my-runc`) - A Step-by-Step Flow
 
-This is the code that lives in the `my-runc/` directory.
+This chapter details the entire lifecycle of launching a container using `my-runc`, from the initial command line invocation to the execution of the user's process within its isolated environment. We will trace the flow through distinct phases involving the "Parent" and "Child" processes, clarifying the crucial role of `exec` system calls and inter-process communication.
 
-### 2.1 The Entry Point: Command Dispatching
+### Introduction: The Journey of a Container Command
+
+When you type `sudo ./my-runc run --ip 10.244.0.100 sh -c "ip addr && ping -c 1 8.8.8.8"`, you initiate a complex dance between several processes and the Linux kernel. Here's the high-level sequence:
+
+1.  **User Invokes `my-runc` (Initial Process):** This is the first `my-runc` instance, which we'll call the **Parent Process**. Its main job is to prepare for the container and launch a specialized child.
+2.  **Parent Launches Child (`clone()` + First `exec`):** The Parent Process creates a *new* process, explicitly asking the kernel to create it within specific Linux Namespaces (PID, Network, Mount, etc.). This new process then immediately `exec`s the `my-runc` binary itself, but now running in "child" mode. This is the **Child Process**. Crucially, the *original Parent Process continues to run* at this stage.
+3.  **Child Performs Internal Setup:** The Child Process, now running inside the new namespaces, performs essential internal configuration like setting resource limits (Cgroups) and establishing its isolated root filesystem (`pivot_root`).
+4.  **Parent Completes External Setup:** While the Child is paused, the Parent Process finishes any external configuration that requires the Child's newly created namespaces (e.g., setting up the network for the container).
+5.  **Synchronization and Handover:** The Parent signals the Child that external setup is complete.
+6.  **Child Launches User Command (Second `exec`):** The Child Process then `exec`s the user's requested command (e.g., `sh -c "ip addr..."`), *replacing itself* entirely with that command. This is the final process running inside the container.
+7.  **Parent Waits:** The Parent Process waits for the user's command to complete, then cleans up.
+
+This journey involves two distinct `exec` calls and a synchronized interaction to ensure a robust and isolated container environment.
+
+### 2.1 Initial Invocation: The User's Command (`my-runc/main.go`)
 
 **File:** `my-runc/main.go`
 
-Our `main()` function uses a `switch` statement to handle the "Parent" vs. "Child" logic. This is the initial dispatch point when you run the `my-runc` executable.
+When you execute `my-runc` from the command line, the `main()` function is the first entry point. It parses the command-line arguments and dispatches to different internal functions based on the subcommand provided.
 
 ```go
-// my-runc/main.go (simplified)
+// my-runc/main.go (simplified excerpt)
+package main
+
+import (
+	"log"
+	"os"
+	"os/exec"
+    "io" // Used by the 'child' case
+)
+
 func main() {
-    // ... argument parsing ...
-    command := os.Args[1] // e.g., "run", "child"
-    
-    switch command {
-    case "run":
-        // The Parent: This case is executed when you run `sudo ./my-runc run ...`
-        // It's responsible for setting up the initial environment and re-executing itself
-        // in "child" mode to perform the actual container setup.
-        ip := os.Args[3] // Extract IP address if provided
-        commandToRun := os.Args[4:] // The command to run inside the container
-        run(commandToRun, ip) 
-    case "child":
-        // The Child: This case is executed when my-runc calls itself with the "child" argument.
-        // It's now running inside the newly created namespaces and will set up cgroups,
-        // the root filesystem, and finally execute the user's command.
-        
-        // This is the child's side of the pipe synchronization.
-        // It receives the read-end of the pipe (file descriptor 3) from the parent.
-        // It blocks here until the parent writes to the pipe, signaling it to proceed.
-        pipe := os.NewFile(3, "pipe") // Open file descriptor 3 as a pipe
-        defer pipe.Close() // Ensure the pipe is closed when done
-        
-        // Read from the pipe. This call will block until the parent writes.
-        // This ensures the parent finishes network setup before the child proceeds.
-        if _, err := io.ReadAll(pipe); err != nil {
-            log.Fatalf("Child failed to read from pipe: %v", err)
-        }
-        
-        setupCgroups()
-        setupRootFS("/") // Setup the isolated filesystem
-        
-        // After setup, the child process replaces itself with the user's command.
-        // os.Args = os.Args[2:] adjusts arguments so the first argument is the command itself.
-        // The Run() here is usually a wrapper around syscall.Exec.
-        // This is the final `exec` in the chain.
-        os.Args = os.Args[2:] 
-        exec.Command(os.Args[0], os.Args[1:]...).Run() 
-    }
+    // Basic argument validation
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: my-runc <command> [args...]")
+	}
+
+	command := os.Args[1]
+	log.Printf("my-runc command: %s", command)
+
+	switch command {
+	case "run":
+        // This 'run' case is for the initial user invocation.
+        // It prepares arguments and calls the `run` function (defined in run_linux.go).
+		args := os.Args[2:]
+		var ip string // Extracts optional IP for network setup
+		if len(args) > 0 && args[0] == "--ip" {
+			if len(args) < 3 {
+				log.Fatal("Usage: my-runc run --ip <ip> <command>")
+			}
+			ip = args[1]
+			args = args[2:]
+		} else {
+			if len(args) < 1 {
+				log.Fatal("Usage: my-runc run <command>")
+			}
+		}
+		run(args, ip) // Hand off to the 'run' function for parent logic
+
+	case "child":
+        // This 'child' case is NOT called directly by the user.
+        // It's called when the *parent* `my-runc` process re-executes itself
+        // to create the actual container environment.
+        // Its detailed flow is covered in Section 2.3.
+		if len(os.Args) < 3 { /* ... */ }
+		commandToRun := os.Args[2:]
+		log.Printf("Running command in child: %s", commandToRun)
+
+		// 1. Setup cgroups for resource limiting
+		if err := setupCgroups(); err != nil { /* ... */ }
+
+		// 2. Setup root filesystem for isolation
+		if err := setupRootFS("/"); err != nil { /* ... */ }
+
+		// 3. WAIT FOR NETWORK SIGNAL (Synchronization with Parent)
+		pipe := os.NewFile(3, "pipe") /* ... */
+		log.Println("Waiting for network setup signal from parent...")
+		if _, err := io.ReadAll(pipe); err != nil { /* ... */ }
+		pipe.Close()
+		log.Println("Network setup signal received. Proceeding to execute command.")
+
+		// 4. Execute the user's command (This will be the SECOND `exec` in the overall flow)
+		cmd := exec.Command(commandToRun[0], commandToRun[1:]...) /* ... */
+		if err := cmd.Run(); err != nil { /* ... */ }
+
+	case "spec":
+        // This command (placeholder) would generate a container configuration file (e.g., an OCI runtime specification).
+		log.Println("Generating container specification (placeholder)...")
+
+	case "version":
+        // This command displays the current version of the my-runc binary.
+		log.Println("my-runc version 0.1.0")
+
+	default:
+		log.Printf("Unknown command: %s", command)
+		log.Println("Available commands: run, child, spec, version")
+		os.Exit(1)
+	}
 }
 ```
 
-### 2.2 The "Re-Execution" Pattern (The Fork/Exec Loop)
+### 2.2 Phase 1: The Parent Process - Setting the Stage (`my-runc/run_linux.go`)
 
 **File:** `my-runc/run_linux.go`
 
-This section details the "re-execution" pattern, which is crucial for setting up the container environment. It's important to note that this pattern primarily relies on the `exec` system call, not `fork` followed by `exec` in the traditional sense where the parent process continues to run.
+After `my-runc run` is invoked, the `main()` function calls the `run()` function. This `run()` function is the **Parent Process** responsible for orchestrating the initial steps of container creation. It prepares the environment and launches the specialized "child" `my-runc` process in its own isolated namespaces.
 
-**How `exec` works here:**
+**The Parent Process Flow:**
 
-1.  **Parent Initiates `exec`:** The `run()` function in `run_linux.go` prepares the environment for the new process. It configures `syscall.SysProcAttr` with the desired namespace flags. Then, it calls `exec.Command("/proc/self/exe", "child", ...)`.
-    *   `/proc/self/exe`: This is a special symbolic link in Linux that always points to the executable file of the current process. When `my-runc` executes itself, this path correctly refers back to the `my-runc` binary.
-    *   `"child"`: This is an argument passed to the re-executed process, signaling it to enter the "child" mode where it performs the container setup.
-    *   The rest of the arguments (like `--ip` and the user's command) are also passed along.
-
+1.  **Creating a Synchronization Pipe:**
+    The parent first creates an anonymous pipe (`r`, `w`). This pipe is a critical inter-process communication (IPC) mechanism used to synchronize the parent's external setup actions with the child's internal workflow.
     ```go
-    // my-runc/run_linux.go (within the run() function)
-    func run(commandToRun []string, ip string) {
-        log.Printf("Running command: %s with IP: %s", commandToRun, ip)
-
-        // 1. Create Synchronization Pipe
-        // This pipe is used to synchronize the parent and child processes.
-        // The parent will block until network setup is done, then signal the child to proceed.
-        r, w, err := os.Pipe()
-        if err != nil {
-            log.Fatalf("Failed to create pipe: %v", err)
-        }
-
-        // Re-execute my-runc itself with the "child" command.
-        // This process will *replace* the current 'run' process.
-        cmd := exec.Command("/proc/self/exe", append([]string{"child"}, commandToRun...)...)
-        cmd.Stdin = os.Stdin
-        cmd.Stdout = os.Stdout
-        cmd.Stderr = os.Stderr
-        
-        // 4. Configure SysProcAttr (Linux-specific process attributes)
-        // This is where we define the namespaces for the *new* process.
-        cmd.SysProcAttr = &syscall.SysProcAttr{
-            Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWNET | syscall.CLONE_NEWUSER,
-            UidMappings: []syscall.SysProcIDMap{
-                {
-                    ContainerID: 0, // Inside container, uid is 0 (root)
-                    HostID:      os.Getuid(), // Outside, it maps to the current host user's UID
-                    Size:        1,
-                },
-            },
-            GidMappings: []syscall.SysProcIDMap{
-                {
-                    ContainerID: 0, // Inside container, gid is 0 (root)
-                    HostID:      os.Getgid(), // Outside, it maps to the current host user's GID
-                    Size:        1,
-                },
-            },
-        }
-
-        // Pass the read-end of the pipe to the child process.
-        // It will be available as file descriptor 3 in the child.
-        cmd.ExtraFiles = []*os.File{r}
-
-        // 2. Start the Child (Fork/Clone + Exec)
-        // cmd.Start() internally calls clone() with the configured SysProcAttr flags
-        // and then execve() for the new process.
-        // The child will start but block reading from FD 3, waiting for the parent's signal.
-        if err := cmd.Start(); err != nil {
-            log.Fatalf("Failed to run container: %v", err)
-        }
-
-        // Close parent's copy of the read-end (r) as it's no longer needed in the parent.
-        r.Close()
-
-        // 3. Setup Network (if requested) - this happens in the parent process.
-        // The network setup often involves moving one end of a veth pair into the child's
-        // newly created network namespace.
-        if ip != "" {
-            if err := setupNetwork(cmd.Process.Pid, ip+"/16", "my-bridge0", "10.244.0.1/16"); err != nil {
-                log.Printf("Setup network failed: %v", err)
-                cmd.Process.Kill()
-                os.Exit(1)
-            }
-        }
-
-        // 4. Signal Child to Continue
-        // Write "OK" to the pipe. This unblocks the child process.
-        // The child can now proceed with its internal setup (cgroups, rootfs, etc.).
-        w.Write([]byte("OK"))
-        w.Close() // Close the write-end of the pipe.
-
-        // 5. Wait for Child to Finish
-        // The parent waits for the container process (which is now the user's command) to complete.
-        if err := cmd.Wait(); err != nil {
-            log.Fatalf("Container process failed: %v", err)
-        }
+    // my-runc/run_linux.go (within run() function)
+    r, w, err := os.Pipe()
+    if err != nil {
+        log.Fatalf("Failed to create pipe: %v", err)
     }
     ```
+    *Detail*: `r` is the read-end, `w` is the write-end. The child will inherit `r` and block on it, while the parent holds `w` and writes to it when ready.
 
-### 2.2.1 The Beauty of Pipe Synchronization (Parent-Child IPC)
-
-The pipe created and passed via `ExtraFiles` before `exec` is a common and elegant Unix pattern for inter-process communication (IPC) and synchronization. This mechanism leverages the fundamental concept of file descriptor inheritance in Linux.
-
-**How the Pipe Orchestrates the Container Setup:**
-
-1.  **Parent Creates the Pipe:** In `run_linux.go`, the parent process creates a pipe (`r`, `w`). `r` is the read-end, `w` is the write-end.
+2.  **Configuring Child Process Attributes (`syscall.SysProcAttr`):**
+    The parent prepares a command (`cmd`) to re-execute `my-runc` itself as a child. Crucially, it configures `cmd.SysProcAttr` with specific flags that tell the Linux kernel *how* to create the new child process.
     ```go
-    // my-runc/run_linux.go
-    r, w, err := os.Pipe()
+    // my-runc/run_linux.go (within run() function)
+    cmd := exec.Command("/proc/self/exe", append([]string{"child"}, commandToRun...)...)
+    // ...
+    cmd.SysProcAttr = &syscall.SysProcAttr{
+        Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWNET | syscall.CLONE_NEWUSER,
+        UidMappings: []syscall.SysProcIDMap{ /* ... */ },
+        GidMappings: []syscall.SysProcIDMap{ /* ... */ },
+    }
     ```
+    *Detail*: The `Cloneflags` specify which new namespaces (PID, Mount, UTS, IPC, Network, User) the child process should be created within. `UidMappings` and `GidMappings` configure user ID remapping for security. (See Section 2.4 for more on Namespaces).
 
-2.  **Parent Passes Read-End to Child:** The parent explicitly passes the read-end (`r`) of this pipe to the child process via `cmd.ExtraFiles`. When the child process starts, it inherits this file descriptor, typically as file descriptor `3` (since `0`, `1`, `2` are standard input, output, and error).
+3.  **Passing the Pipe's Read-End to the Child:**
+    The parent passes the read-end (`r`) of the synchronization pipe to the child process using `cmd.ExtraFiles`. This makes `r` available to the child as file descriptor 3.
     ```go
-    // my-runc/run_linux.go
+    // my-runc/run_linux.go (within run() function)
     cmd.ExtraFiles = []*os.File{r}
     ```
+    *Detail*: The child will use this to receive signals from the parent.
 
-3.  **Child Blocks on Reading from Pipe:** In `main.go`'s `child` case, the newly spawned "child" `my-runc` process immediately tries to read from this inherited pipe using `os.NewFile(3, "pipe")` and `io.ReadAll(pipe)`. Because the parent hasn't written anything yet, this read operation *blocks*, effectively pausing the child.
+4.  **Launching the Child Process (First `exec`):**
+    The parent calls `cmd.Start()`. This is the first significant `exec` transition.
     ```go
-    // my-runc/main.go (within case "child")
-    pipe := os.NewFile(3, "pipe") // Child opens inherited FD 3
-    defer pipe.Close()
-    if _, err := io.ReadAll(pipe); err != nil { // Child blocks here
-        log.Fatalf("Child failed to read from pipe: %v", err)
+    // my-runc/run_linux.go (within run() function)
+    if err := cmd.Start(); err != nil {
+        log.Fatalf("Failed to run container: %v", err)
     }
-    // Child unblocks and continues...
+    ```
+    *Detail*: `cmd.Start()` performs the `clone()` system call with the `SysProcAttr` flags, creating a *new process* that immediately `exec`s the `my-runc` binary (in "child" mode) into its new namespaces. **The original Parent Process `my-runc run` *continues to run* after this step; it is not replaced yet.**
+
+5.  **Parent Closes its Read-End:**
+    Immediately after launching the child, the parent closes its copy of the pipe's read-end (`r`). This is good practice to avoid resource leaks.
+    ```go
+    // my-runc/run_linux.go (within run() function)
+    r.Close()
     ```
 
-4.  **Parent Performs Critical External Setup:** While the child is blocked, the parent process proceeds with external setup tasks that *must* happen after the child's namespaces are created but *before* the child configures itself internally. The primary example here is the `setupNetwork` function, which needs the child's PID to move a veth interface into the child's new network namespace. This action cannot occur before the child process (and its namespaces) exist.
+6.  **Parent Performs External Setup (e.g., Network Configuration):**
+    With the child process now existing in its new namespaces, the parent can perform external setup tasks that require interaction with these namespaces. Network configuration, for instance, often involves moving virtual network interfaces *into* the child's network namespace, an operation that must be done by the parent (or a privileged process).
     ```go
-    // my-runc/run_linux.go (after cmd.Start() and r.Close())
-    if ip != "" {
+    // my-runc/run_linux.go (within run() function)
+    if ip != "" { // If an IP was specified, configure the network
+        // `setupNetwork` uses the child's PID to move network devices into its new namespace.
         if err := setupNetwork(cmd.Process.Pid, ip+"/16", "my-bridge0", "10.244.0.1/16"); err != nil {
-            // ...
+            log.Printf("Setup network failed: %v", err)
+            cmd.Process.Kill() // Kill child if network setup fails
+            os.Exit(1)
         }
     }
     ```
+    *Detail*: At this point, the child is blocked on the pipe, waiting.
 
-5.  **Parent Signals Child to Proceed:** Once the parent completes its network setup (or any other required external configuration), it writes a byte (e.g., "OK") to the *write-end* (`w`) of the pipe. It then closes both its `r` and `w` file descriptors.
+7.  **Parent Signals Child to Proceed:**
+    Once all external setup (like network configuration) is complete, the parent writes a byte to the pipe's write-end (`w`). This unblocks the child process. The parent then closes its write-end (`w`).
     ```go
-    // my-runc/run_linux.go (after setupNetwork)
+    // my-runc/run_linux.go (within run() function)
     w.Write([]byte("OK"))
     w.Close()
     ```
+    *Detail*: This is the synchronization point.
 
-6.  **Child Unblocks and Continues Internal Setup:** The moment the parent writes to the pipe, the child's blocked `io.ReadAll(pipe)` call returns. The child is now unblocked and proceeds to execute its internal setup routines, such as `setupCgroups()` and `setupRootFS()`, knowing that all necessary external configurations have been completed by the parent.
+8.  **Parent Waits for Child's Completion:**
+    Finally, the parent calls `cmd.Wait()`, which pauses the parent until the child process (which, as we'll see, will eventually become the user's command) exits.
+    ```go
+    // my-runc/run_linux.go (within run() function)
+    if err := cmd.Wait(); err != nil {
+        log.Fatalf("Container process failed: %v", err)
+    }
+    ```
+    *Detail*: This ensures the `my-runc` command itself doesn't exit until the container has finished its work.
 
-**Why this Pattern is "Beautiful" (and Critical OS Fundamentals):**
+### 2.3 Phase 2: The Child Process - Internal Container Setup (`my-runc/main.go` and `my-runc/namespace_linux.go`)
 
-*   **Guaranteed Order of Operations:** This pipe acts as a precise synchronization barrier. It strictly enforces a critical sequence: Child process with new namespaces created -> Parent manipulates child's new namespaces (e.g., network setup) -> Child proceeds with internal setup (e.g., `pivot_root`). This prevents race conditions and ensures the container environment is configured correctly.
-*   **Decoupling External vs. Internal Setup:** It elegantly separates responsibilities. The parent handles operations that require privileges or interaction with the host system's global state (like creating veth pairs and moving one end). The child handles internal configurations within its own isolated namespaces.
-*   **Atomic Namespace Creation and Manipulation:** The `clone()` system call (triggered by `cmd.Start()`) atomically creates the new process *with* its requested namespaces. The pipe then allows the parent to immediately begin manipulating these newly created namespaces before the child has fully initialized itself, ensuring a tight coupling of these critical steps.
-*   **Efficiency and Robustness:** Using pipes for this specific type of synchronization is lightweight, efficient, and a standard, robust Unix IPC mechanism. It avoids more complex synchronization primitives for this simple "wait for signal" scenario.
+**File:** `my-runc/main.go` and `my-runc/namespace_linux.go`
 
-This pattern demonstrates a deep understanding of process lifecycle, file descriptor management, and IPC fundamentals, all essential for building robust container runtimes.
+The "child" `my-runc` process begins its execution immediately after the `cmd.Start()` call by the parent. It runs the `main()` function's `child` case, already within its newly created, isolated namespaces. Its role is to finalize the container's environment and then hand control to the user's specified command.
 
----
+**The Child Process Flow:**
 
-### 2.3 Linux Namespaces: The Six Walls of Isolation
+1.  **Child `my-runc` Starts in New Namespaces:**
+    The process begins executing the `child` case in `main.go`. At this point, it is already operating within its own dedicated PID, Mount, Network, UTS, IPC, and User namespaces, as requested by the parent's `Cloneflags`. It has also inherited file descriptor 3, which is the read-end of the synchronization pipe.
+    ```go
+    // my-runc/main.go (within case "child")
+    // ... (argument parsing) ...
+    log.Printf("Running command in child: %s", commandToRun)
+    ```
 
-**File:** `my-runc/run_linux.go` (primarily where `SysProcAttr` is configured) and `my-runc/namespace_linux.go` (for functions like `setupRootFS`, `setupCgroups`).
+2.  **Internal Resource Limit Setup (`setupCgroups()`):**
+    The child first calls `setupCgroups()`. This function configures resource constraints (like memory limits) for the container. It does this by interacting with the cgroup filesystem, which is exposed by the kernel.
+    ```go
+    // my-runc/main.go (within case "child")
+    if err := setupCgroups(); err != nil {
+        log.Fatalf("Failed to setup cgroups: %v", err)
+    }
+    ```
+    *Detail*: (See Section 2.6 for more on Cgroups).
 
-In the `run()` function within `my-runc/run_linux.go`, we configure the `syscall.SysProcAttr` struct. This is where we instruct the Linux Kernel on how to create the new, isolated environment for the child process.
+3.  **Internal Filesystem Setup (`setupRootFS()`):**
+    Next, the child calls `setupRootFS()`. This is crucial for isolating the container's view of the filesystem from the host. It uses the `pivot_root` system call to switch the root directory of the container.
+    ```go
+    // my-runc/main.go (within case "child")
+    if err := setupRootFS("/"); err != nil {
+        log.Fatalf("Failed to setup root filesystem: %v", err)
+    }
+    ```
+    *Detail*: (See Section 2.5 for more on `pivot_root`).
+
+4.  **Waiting for Parent's External Setup to Complete:**
+    After completing its internal setup (cgroups and rootfs), the child process then actively waits for a signal from the parent. It reads from the inherited pipe (file descriptor 3), which causes it to block until the parent writes to it. This ensures that any external configuration (like network setup by the parent) is finished before the user's command starts.
+    ```go
+    // my-runc/main.go (within case "child")
+    pipe := os.NewFile(3, "pipe") // Child opens inherited FD 3
+    log.Println("Waiting for network setup signal from parent...")
+    if _, err := io.ReadAll(pipe); err != nil { // This read blocks until parent writes
+        log.Fatalf("Child failed to read from pipe during network wait: %v", err)
+    }
+    pipe.Close() // Close the pipe after receiving the signal
+    log.Println("Network setup signal received. Proceeding to execute command.")
+    ```
+    *Detail*: This is the critical synchronization point discussed in Section 2.2.
+
+5.  **Executing the User's Command (Second `exec`):**
+    Once unblocked by the parent's signal, the child process is now ready to run the user's actual command. It achieves this by calling `exec.Command(...).Run()`.
+    ```go
+    // my-runc/main.go (within case "child")
+    cmd := exec.Command(commandToRun[0], commandToRun[1:]...) // Prepare user's command
+    cmd.Stdin = os.Stdin // Inherit stdin, stdout, stderr
+    cmd.Stdout = os.Stdout
+    cmd.Stderr = os.Stderr
+
+    if err := cmd.Run(); err != nil { // This replaces the current child my-runc process
+        log.Fatalf("Failed to run command in container: %v", err)
+    }
+    ```
+    *Detail*: This is the **second and final `exec` call** in the container's lifecycle. The current "child" `my-runc` process is *completely replaced* by the user's command (e.g., `bash`, `ping`, etc.). The `my-runc` binary code is no longer running at this point; only the user's desired program is executing within the fully isolated container environment.
+
+### 2.4 Linux Namespaces: The Walls of Isolation
+
+Linux Namespaces are the fundamental primitives that provide the "isolation" in containers. They virtualize system resources, making a process believe it has its own dedicated copy of a resource, when in reality it's sharing the underlying kernel.
+
+These namespaces are established by the **Parent Process** when it configures the `syscall.SysProcAttr` for the child process.
+
+**File:** `my-runc/run_linux.go` (configuring `SysProcAttr`)
 
 ```go
 // my-runc/run_linux.go (within the run() function, part of cmd.SysProcAttr definition)
@@ -371,118 +430,103 @@ cmd.SysProcAttr = &syscall.SysProcAttr{
 }
 ```
 
-*   **`CLONE_NEWPID` (The Matrix)**:
-    *   **Metaphor:** Every process gets a new ID starting at 1.
-    *   **Code Detail:** The `CLONE_NEWPID` flag ensures that the first process launched in the new container (which is our "child" `my-runc` process, then replaced by the user's command) will see itself as PID 1 within its own namespace.
-    *   **Depth:** The Kernel maintains a translation table. Inside, you are PID 1. Outside, you are PID 4502. If you try to kill PID 2 (the host's second process), the Kernel says "PID 2? Never heard of her."
+*   **`CLONE_NEWPID` (Process ID Namespace)**:
+    *   **Effect:** Provides the container with its own isolated process ID tree. The first process in the new namespace (the user's command) will see itself as PID 1.
+    *   **Mechanism:** The kernel maintains a translation table. PID 1 inside the container might be PID 4502 on the host. Processes in one PID namespace cannot see or interact with processes in another, except through specific namespace-aware mechanisms.
 
-*   **`CLONE_NEWNET` (The Silence)**:
-    *   **Metaphor:** Cutting the phone lines.
-    *   **Code Detail:** With `CLONE_NEWNET`, the child process starts with an empty network stack. The `setupNetwork` function in the parent (`run_linux.go`), using the child's PID, is responsible for configuring network devices (like moving a `veth` end) *into* this new network namespace. The child then brings up its own `lo` interface.
-    *   **Depth:** The process has no network devices until they are manually set up. It cannot even talk to `localhost` until the `lo` interface is brought up.
+*   **`CLONE_NEWNS` (Mount Namespace)**:
+    *   **Effect:** Gives the container its own private set of filesystem mount points. Changes (like mounting or unmounting) within this namespace do not affect the host's filesystem view.
+    *   **Mechanism:** This is fundamental for `pivot_root`, allowing the container to have its own root filesystem entirely separate from the host.
 
-*   **`CLONE_NEWUSER` (The Fake Identity)**:
-    *   **Metaphor:** You are a King in your room, but a Peasant in the hallway.
-    *   **Code Detail:** The `UidMappings` and `GidMappings` within `SysProcAttr` define how user/group IDs inside the new user namespace map to IDs on the host. This allows the container's root user (UID 0) to be mapped to an unprivileged user on the host, preventing the container's root from having root privileges outside its namespace.
-    *   **Depth:** Maps Container-UID 0 (Root) to Host-UID 1000 (You). You can run `apt install` inside because you are "root", but you cannot delete `/etc/shadow` on the host because the host sees you as a regular user.
+*   **`CLONE_NEWUTS` (UTS Namespace)**:
+    *   **Effect:** Isolates the hostname and NIS domain name. The container can have its own hostname, distinct from the host's.
 
-### 2.4 Filesystem Isolation: `pivot_root` internals
+*   **`CLONE_NEWIPC` (IPC Namespace)**:
+    *   **Effect:** Isolates System V Inter-Process Communication (IPC) objects (message queues, semaphores, shared memory) and POSIX message queues. Processes in different IPC namespaces cannot interfere with each other's IPC mechanisms.
+
+*   **`CLONE_NEWNET` (Network Namespace)**:
+    *   **Effect:** Provides the container with its own isolated network stack, including network interfaces, IP addresses, routing tables, and firewall rules. It starts as a completely empty network environment.
+    *   **Mechanism:** The parent process (`my-runc run`) is responsible for configuring network devices (like `veth` pairs) *into* this newly created, empty network namespace.
+
+*   **`CLONE_NEWUSER` (User Namespace)**:
+    *   **Effect:** Isolates user and group IDs. This is a crucial security feature. It allows a process to have UID 0 (root) privileges *inside* the container, while mapping to an unprivileged user ID on the host system.
+    *   **Mechanism:** The `UidMappings` and `GidMappings` within `SysProcAttr` explicitly define this translation. For example, container UID 0 might map to host UID 1000. This means a malicious actor gaining root inside the container does not gain root on the host.
+
+### 2.5 Filesystem Isolation: `pivot_root` Internals
 
 **File:** `my-runc/namespace_linux.go` -> `setupRootFS()`
 
-This function is responsible for establishing the container's root filesystem using `pivot_root`, which is preferred over `chroot` because it provides stronger isolation. This logic runs in the "child" `my-runc` process *after* it has been launched into its new namespaces.
+This function, executed by the **Child Process**, is responsible for establishing the container's isolated root filesystem. It uses `pivot_root`, which provides stronger isolation than `chroot` because it completely detaches the old root filesystem.
 
-**The Step-by-Step Logic within `setupRootFS()`:**
+**The `setupRootFS()` Flow:**
 
 ```go
 // my-runc/namespace_linux.go
 func setupRootFS(rootfs string) error {
 	log.Println("Setting up root filesystem...")
 
-	// 1. Create a location for the new root
-	// We use a temporary directory to act as the new root mount point.
-	// This directory (`/tmp/my-runc-root`) will temporarily hold the new rootfs before pivot_root.
+	// 1. Prepare New Root Directory:
+    // A temporary directory (`/tmp/my-runc-root`) is created. This will momentarily serve as the
+    // mount point for the container's desired root filesystem before `pivot_root` makes it the actual `/`.
 	newRoot := "/tmp/my-runc-root"
-	if err := os.MkdirAll(newRoot, 0755); err != nil {
-		return fmt.Errorf("failed to create new root dir: %w", err)
-	}
+	if err := os.MkdirAll(newRoot, 0755); err != nil { /* ... */ }
 
-	// 2. Bind mount the desired rootfs (e.g. "/") to the new location.
-	// `rootfs` is typically the path to the container's image (e.g., a busybox directory).
-	// `syscall.MS_BIND` makes a bind mount: the contents of `rootfs` now appear at `newRoot`.
-	// `syscall.MS_REC` makes it recursive, binding all submounts.
-	// This makes 'newRoot' a mount point with the content of 'rootfs'.
-	if err := syscall.Mount(rootfs, newRoot, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("failed to bind mount rootfs to new root: %w", err)
-	}
+	// 2. Bind Mount the Container Image:
+    // The path to the container's root filesystem image (`rootfs`, e.g., a directory containing busybox)
+    // is bind-mounted onto `newRoot`. This means the contents of `rootfs` now appear at `newRoot`.
+    // `syscall.MS_BIND` creates the bind mount; `syscall.MS_REC` makes it recursive for submounts.
+	if err := syscall.Mount(rootfs, newRoot, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil { /* ... */ }
 
-	// 3. Make the new root's mount point private to this namespace
-	// `syscall.MS_PRIVATE` ensures that any mount/unmount events within this mount point
-	// are not propagated to other mount namespaces (e.g., the host).
-	if err := syscall.Mount(newRoot, newRoot, "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("failed to make new root private: %w", err)
-	}
+	// 3. Make New Root's Mount Point Private:
+    // This ensures that any mount/unmount operations within this `newRoot` do not
+    // propagate to other mount namespaces (especially the host's mount namespace).
+	if err := syscall.Mount(newRoot, newRoot, "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil { /* ... */ }
 
-	// 4. Create directory for the old root inside the new root
-	// `putOld` is a temporary directory within `newRoot` where the *original* rootfs
-	// will be mounted after the `pivot_root` call. This is required by `pivot_root`.
+	// 4. Create Directory for Old Root:
+    // A temporary directory (`.pivot_root`) is created *inside* the `newRoot`. This is a requirement
+    // for `pivot_root`; the old root filesystem will be moved and mounted here.
 	putOld := filepath.Join(newRoot, ".pivot_root")
-	if err := os.Mkdir(putOld, 0777); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("failed to create put_old directory: %w", err)
-	}
+	if err := os.Mkdir(putOld, 0777); err != nil && !os.IsExist(err) { /* ... */ }
 
-	// 5. Pivot Root
-	// `syscall.PivotRoot(newRoot, putOld)`: This is the atomic swap.
-	// The `newRoot` (`/tmp/my-runc-root`) becomes the new root filesystem (`/`) for this process.
-	// The *original* root filesystem is moved and mounted at `putOld` (`/.pivot_root`).
-	if err := syscall.PivotRoot(newRoot, putOld); err != nil {
-		return fmt.Errorf("failed to pivot_root: %w", err)
-	}
+	// 5. Perform `pivot_root` System Call:
+    // This is the atomic swap. `newRoot` becomes the new `/` for the process,
+    // and the original root filesystem is moved and mounted at `putOld` (`/.pivot_root` relative to the new root).
+	if err := syscall.PivotRoot(newRoot, putOld); err != nil { /* ... */ }
 
-	// 6. Change the current working directory to the new root ("/")
-	// After `pivot_root`, the current working directory might still be pointing
-	// to a location in the old root, so we change to `/` (the new root).
-	if err := os.Chdir("/"); err != nil {
-		return fmt.Errorf("failed to change directory to new root: %w", err)
-	}
+	// 6. Change Current Working Directory:
+    // The current working directory is set to `/` (the new root) to ensure consistency.
+	if err := os.Chdir("/"); err != nil { /* ... */ }
 
-	// 7. Unmount the old root
-	// The old root, now at `/.pivot_root`, needs to be unmounted to completely
-	// sever the connection to the host's original filesystem.
-	// `syscall.MNT_DETACH` allows unmounting even if the filesystem is busy.
-	if err := syscall.Unmount("/.pivot_root", syscall.MNT_DETACH); err != nil {
-		return fmt.Errorf("failed to unmount old root: %w", err)
-	}
+	// 7. Unmount the Old Root:
+    // The old root (now accessible at `/.pivot_root`) is unmounted. `syscall.MNT_DETACH` allows
+    // unmounting even if it's "busy", effectively severing the link to the host's original filesystem.
+	if err := syscall.Unmount("/.pivot_root", syscall.MNT_DETACH); err != nil { /* ... */ }
 
-	// 8. Remove the temporary directory `/.pivot_root`
-	// This removes the now empty directory that held the old root mount point.
-	if err := os.Remove("/.pivot_root"); err != nil {
-		return fmt.Errorf("failed to remove put_old directory: %w", err)
-	}
+	// 8. Remove Temporary Directory:
+    // The empty `.pivot_root` directory is removed.
+	if err := os.Remove("/.pivot_root"); err != nil { /* ... */ }
 
-	// 9. Mount proc filesystem
-	// The `/proc` filesystem is crucial for processes to interact with the kernel
-	// and view process information (e.g., `ps`, `top`). Since we have a new PID
-	// namespace, we need to mount a new `/proc` specifically for this container.
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		return fmt.Errorf("failed to mount proc: %w", err)
-	}
+	// 9. Mount `/proc` Filesystem:
+    // A new `/proc` filesystem is mounted. This is crucial for processes within the container
+    // to correctly see their own process information (PIDs, etc.) and interact with the kernel,
+    // reflecting the container's isolated PID namespace.
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil { /* ... */ }
 
 	log.Println("Root filesystem setup complete")
 	return nil
 }
 ```
+*   **Result:** The container now has a completely independent root filesystem. Any attempt by a process inside the container to `cd ../../../` will remain within this new isolated filesystem; it is physically impossible to access the host's original file hierarchy.
 
-*   **The old host filesystem is now gone** from the container's perspective. If the process tries to `cd ../../../`, it will just navigate within the new root filesystem, as it's physically impossible to see the host's files.
-
-### 2.5 Control Groups (Cgroups): Resource Metering
+### 2.6 Control Groups (Cgroups): Resource Metering
 
 **File:** `my-runc/namespace_linux.go` -> `setupCgroups()`
 
-Namespaces are about **Isolation**. Cgroups are about **Resource Limits**. This function configures resource constraints for the container. This logic runs in the "child" `my-runc` process, configuring limits for itself and any child processes it spawns (i.e., the user's command).
+Namespaces are about **Isolation**, preventing processes from seeing each other's resources. Cgroups (Control Groups) are about **Resource Limits**, controlling how much of a resource processes can *use*. This function, executed by the **Child Process**, configures resource constraints for the container.
 
-**How we talk to the Kernel via the Cgroup Filesystem:**
-The Linux Kernel exposes Cgroups as a virtual filesystem, typically mounted at `/sys/fs/cgroup`. We interact with it by creating directories and writing values to control files.
+**The `setupCgroups()` Flow (Interacting with the Kernel via Filesystem):**
+
+The Linux kernel exposes Cgroups as a virtual filesystem, typically mounted at `/sys/fs/cgroup`. `setupCgroups()` interacts with this filesystem by creating directories and writing values to special control files.
 
 ```go
 // my-runc/namespace_linux.go
@@ -493,64 +537,48 @@ func setupCgroups() error {
 	var memPath string
 	var limitFile string
 	
-	// Dynamically determine Cgroups version (v1 or v2)
-	// Cgroups v1 often has controllers (like 'memory') mounted separately.
-	// Cgroups v2 uses a unified hierarchy.
+	// 1. Determine Cgroups Version (v1 or v2):
+    // The code checks for the existence of `/sys/fs/cgroup/memory` to determine
+    // if Cgroups v1 (with a separate memory controller hierarchy) or v2 (unified hierarchy) is in use.
 	if _, err := os.Stat(filepath.Join(cgroupPath, "memory")); err == nil {
-		// Cgroups v1 detected: memory controller is mounted at /sys/fs/cgroup/memory
 		log.Println("Detected Cgroups v1")
-		memPath = filepath.Join(cgroupPath, "memory", "my-container") // Path for our container's memory cgroup
-		limitFile = "memory.limit_in_bytes" // Cgroups v1 uses this file for memory limit
+		memPath = filepath.Join(cgroupPath, "memory", "my-container") // Path for v1 memory cgroup
+		limitFile = "memory.limit_in_bytes" // Cgroups v1 memory limit file
 	} else {
-		// Cgroups v2 detected: unified hierarchy, control files are directly in our cgroup dir.
 		log.Println("Detected Cgroups v2")
-		memPath = filepath.Join(cgroupPath, "my-container") // Path for our container's cgroup
-		limitFile = "memory.max" // Cgroups v2 uses 'memory.max' for memory limit
+		memPath = filepath.Join(cgroupPath, "my-container") // Path for v2 unified cgroup
+		limitFile = "memory.max" // Cgroups v2 memory limit file
 	}
 
-	// Create the cgroup directory for this container.
-	// If it already exists, it proceeds without error.
-	if err := os.Mkdir(memPath, 0755); err != nil && !os.IsExist(err) {
-		return fmt.Errorf("failed to create cgroup directory: %w", err)
-	}
+	// 2. Create the Container's Cgroup Directory:
+    // A new directory (e.g., `/sys/fs/cgroup/memory/my-container` for v1, or `/sys/fs/cgroup/my-container` for v2)
+    // is created. The kernel automatically populates this directory with control files relevant to the cgroup.
+	if err := os.Mkdir(memPath, 0755); err != nil && !os.IsExist(err) { /* ... */ }
 
-	// Move the current process (the "child" my-runc process) into the new cgroup.
-	// This means all processes spawned by this "child" process (including the user's command)
-	// will inherit these cgroup limits.
+	// 3. Assign Current Process to Cgroup:
+    // The PID of the current process (the child `my-runc` process) is written into
+    // the `cgroup.procs` (for v1) or `cgroup.threads` (for v2 if `cgroup.procs` is absent) file within the new cgroup.
+    // This associates the process and all its future descendants (including the user's command)
+    // with this cgroup, subjecting them to its limits.
 	pid := os.Getpid()
-	procsFile := filepath.Join(memPath, "cgroup.procs") // File to list processes in the cgroup (v1)
-	if _, err := os.Stat(procsFile); os.IsNotExist(err) { // If cgroup.procs doesn't exist (e.g., v2)
-		procsFile = filepath.Join(memPath, "cgroup.threads") // Use cgroup.threads for v2
+	procsFile := filepath.Join(memPath, "cgroup.procs")
+	if _, err := os.Stat(procsFile); os.IsNotExist(err) {
+		procsFile = filepath.Join(memPath, "cgroup.threads")
 	}
-	
-	if err := os.WriteFile(procsFile, []byte(fmt.Sprintf("%d", pid)), 0700); err != nil {
-		return fmt.Errorf("failed to write to cgroup.procs/threads: %w", err)
-	}
+	if err := os.WriteFile(procsFile, []byte(fmt.Sprintf("%d", pid)), 0700); err != nil { /* ... */ }
 
-	// Set a memory limit of 100MB for the container.
-	// This writes the limit to the appropriate file (memory.limit_in_bytes for v1, memory.max for v2).
+	// 4. Set Memory Limit:
+    // A memory limit (e.g., 100MB) is written to the appropriate memory limit control file
+    // (`memory.limit_in_bytes` for v1 or `memory.max` for v2).
 	memoryLimitBytes := "100000000" // 100MB
 	limitFilePath := filepath.Join(memPath, limitFile)
-	if err := os.WriteFile(limitFilePath, []byte(memoryLimitBytes), 0700); err != nil {
-		return fmt.Errorf("failed to write to memory limit file: %w", err)
-	}
-
-	// Additional cgroup configurations could be added here for CPU, I/O, etc.
-	// For example, setting CPU shares:
-	// if err := os.WriteFile(filepath.Join(memPath, "cpu.shares"), []byte("1024"), 0700); err != nil {
-	//     log.Printf("Failed to set CPU shares: %v", err)
-	// }
+	if err := os.WriteFile(limitFilePath, []byte(memoryLimitBytes), 0700); err != nil { /* ... */ }
 
 	log.Println("Cgroups setup complete")
 	return nil
 }
 ```
-
-*   **How we talk to the Kernel:** The Kernel exposes Cgroups as a filesystem at `/sys/fs/cgroup`.
-*   **1. Create Directory:** We `mkdir` a folder there (e.g., `/sys/fs/cgroup/memory/my-container` for v1 or `/sys/fs/cgroup/my-container` for v2). This creates the control group for our container.
-*   **2. Add PID to `cgroup.procs` (or `cgroup.threads`):** We write the container's PID into the relevant file. This associates the process with the defined cgroup. Any processes added here (and their children) will be subject to the cgroup's limits.
-*   **3. Set Limits:** We write a value (e.g., `100000000` for 100MB) into a control file like `memory.limit_in_bytes` (v1) or `memory.max` (v2).
-*   **The Enforcement:** The Kernel now monitors the process. The moment it attempts to exceed the allocated 100MB of RAM, the Kernel triggers the **OOM Killer** (Out-Of-Memory Killer) and sends a `SIGKILL` signal to terminate the process, enforcing the limit.
+*   **The Enforcement:** Once configured, the Linux kernel actively monitors the processes within this cgroup. If a process attempts to allocate memory beyond the set limit, the kernel will trigger the **OOM Killer** (Out-Of-Memory Killer) and send a `SIGKILL` signal to terminate the offending process, thus enforcing the resource constraint.
 
 ---
 
