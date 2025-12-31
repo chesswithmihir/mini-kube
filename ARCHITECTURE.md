@@ -154,6 +154,19 @@ func main() {
         // The Child: This case is executed when my-runc calls itself with the "child" argument.
         // It's now running inside the newly created namespaces and will set up cgroups,
         // the root filesystem, and finally execute the user's command.
+        
+        // This is the child's side of the pipe synchronization.
+        // It receives the read-end of the pipe (file descriptor 3) from the parent.
+        // It blocks here until the parent writes to the pipe, signaling it to proceed.
+        pipe := os.NewFile(3, "pipe") // Open file descriptor 3 as a pipe
+        defer pipe.Close() // Ensure the pipe is closed when done
+        
+        // Read from the pipe. This call will block until the parent writes.
+        // This ensures the parent finishes network setup before the child proceeds.
+        if _, err := io.ReadAll(pipe); err != nil {
+            log.Fatalf("Child failed to read from pipe: %v", err)
+        }
+        
         setupCgroups()
         setupRootFS("/") // Setup the isolated filesystem
         
@@ -260,9 +273,64 @@ This section details the "re-execution" pattern, which is crucial for setting up
     }
     ```
 
-2.  **The Mystery of `/proc/self/exe`**: As mentioned, this path ensures that `my-runc` is calling a copy of itself. This is essential because the Go runtime needs to be active within the new namespaces to perform their setup (like mounting `/proc` inside the new PID namespace).
+### 2.2.1 The Beauty of Pipe Synchronization (Parent-Child IPC)
 
-3.  **Why?**: The `exec` system call is used to *replace* the current process's image with a new one. This means the original parent `my-runc` process is entirely replaced by the new `my-runc` process running in "child" mode. This "child" `my-runc` process then proceeds to set up the container's namespaces, root filesystem, and cgroups. Once setup is complete, it uses `exec` *again* (within its `main.go`'s "child" case logic) to finally replace itself with the user's desired command (e.g., `bash`). This chain of `exec` calls ensures that the Go setup code runs within the correct isolated environment before the final command takes over.
+The pipe created and passed via `ExtraFiles` before `exec` is a common and elegant Unix pattern for inter-process communication (IPC) and synchronization. This mechanism leverages the fundamental concept of file descriptor inheritance in Linux.
+
+**How the Pipe Orchestrates the Container Setup:**
+
+1.  **Parent Creates the Pipe:** In `run_linux.go`, the parent process creates a pipe (`r`, `w`). `r` is the read-end, `w` is the write-end.
+    ```go
+    // my-runc/run_linux.go
+    r, w, err := os.Pipe()
+    ```
+
+2.  **Parent Passes Read-End to Child:** The parent explicitly passes the read-end (`r`) of this pipe to the child process via `cmd.ExtraFiles`. When the child process starts, it inherits this file descriptor, typically as file descriptor `3` (since `0`, `1`, `2` are standard input, output, and error).
+    ```go
+    // my-runc/run_linux.go
+    cmd.ExtraFiles = []*os.File{r}
+    ```
+
+3.  **Child Blocks on Reading from Pipe:** In `main.go`'s `child` case, the newly spawned "child" `my-runc` process immediately tries to read from this inherited pipe using `os.NewFile(3, "pipe")` and `io.ReadAll(pipe)`. Because the parent hasn't written anything yet, this read operation *blocks*, effectively pausing the child.
+    ```go
+    // my-runc/main.go (within case "child")
+    pipe := os.NewFile(3, "pipe") // Child opens inherited FD 3
+    defer pipe.Close()
+    if _, err := io.ReadAll(pipe); err != nil { // Child blocks here
+        log.Fatalf("Child failed to read from pipe: %v", err)
+    }
+    // Child unblocks and continues...
+    ```
+
+4.  **Parent Performs Critical External Setup:** While the child is blocked, the parent process proceeds with external setup tasks that *must* happen after the child's namespaces are created but *before* the child configures itself internally. The primary example here is the `setupNetwork` function, which needs the child's PID to move a veth interface into the child's new network namespace. This action cannot occur before the child process (and its namespaces) exist.
+    ```go
+    // my-runc/run_linux.go (after cmd.Start() and r.Close())
+    if ip != "" {
+        if err := setupNetwork(cmd.Process.Pid, ip+"/16", "my-bridge0", "10.244.0.1/16"); err != nil {
+            // ...
+        }
+    }
+    ```
+
+5.  **Parent Signals Child to Proceed:** Once the parent completes its network setup (or any other required external configuration), it writes a byte (e.g., "OK") to the *write-end* (`w`) of the pipe. It then closes both its `r` and `w` file descriptors.
+    ```go
+    // my-runc/run_linux.go (after setupNetwork)
+    w.Write([]byte("OK"))
+    w.Close()
+    ```
+
+6.  **Child Unblocks and Continues Internal Setup:** The moment the parent writes to the pipe, the child's blocked `io.ReadAll(pipe)` call returns. The child is now unblocked and proceeds to execute its internal setup routines, such as `setupCgroups()` and `setupRootFS()`, knowing that all necessary external configurations have been completed by the parent.
+
+**Why this Pattern is "Beautiful" (and Critical OS Fundamentals):**
+
+*   **Guaranteed Order of Operations:** This pipe acts as a precise synchronization barrier. It strictly enforces a critical sequence: Child process with new namespaces created -> Parent manipulates child's new namespaces (e.g., network setup) -> Child proceeds with internal setup (e.g., `pivot_root`). This prevents race conditions and ensures the container environment is configured correctly.
+*   **Decoupling External vs. Internal Setup:** It elegantly separates responsibilities. The parent handles operations that require privileges or interaction with the host system's global state (like creating veth pairs and moving one end). The child handles internal configurations within its own isolated namespaces.
+*   **Atomic Namespace Creation and Manipulation:** The `clone()` system call (triggered by `cmd.Start()`) atomically creates the new process *with* its requested namespaces. The pipe then allows the parent to immediately begin manipulating these newly created namespaces before the child has fully initialized itself, ensuring a tight coupling of these critical steps.
+*   **Efficiency and Robustness:** Using pipes for this specific type of synchronization is lightweight, efficient, and a standard, robust Unix IPC mechanism. It avoids more complex synchronization primitives for this simple "wait for signal" scenario.
+
+This pattern demonstrates a deep understanding of process lifecycle, file descriptor management, and IPC fundamentals, all essential for building robust container runtimes.
+
+---
 
 ### 2.3 Linux Namespaces: The Six Walls of Isolation
 
