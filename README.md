@@ -1,220 +1,86 @@
-# Mini-Kube Project
+# Mini-Kube: The Definitive Systems Textbook Project
 
-This project aims to demystify Docker and Kubernetes by building them from scratch. It provides a hands-on approach to understanding the fundamental Linux kernel concepts that power containerization and orchestration. By building simplified versions of `runc` (container runtime) and Kubernetes (orchestrator), we explore the low-level mechanics that often remain hidden behind high-level tools.
+This project aims to **demystify the "magic" of Docker and Kubernetes** by building foundational components from scratch. It provides a hands-on approach to understanding the fundamental Linux kernel concepts that power modern containerization and orchestration. By building simplified versions of `runc` (container runtime) and Kubernetes (orchestrator), we explore the low-level mechanics that often remain hidden behind high-level tools.
+
+## Project Vision & Goal
+
+**Vision:** To prove that Kubernetes is simply a **Distributed System built on top of File Operations**. By representing Namespaces, Cgroups, and Pod States as files and HTTP requests, we make the complex simple.
+
+**Goal:** To build a **production-principled** container orchestrator. We strip away the "magic" of `docker run` and `kubectl apply` to reveal the raw Linux primitives: `clone`, `pivot_root`, `veth` pairs, and `iptables`. By the end, you will not just *use* Kubernetes; you will understand the syscalls that make it possible.
+
+---
 
 ## Part 1: `my-runc` - The Container Runtime
 
-`my-runc` is our simplified implementation of `runc`, the OCI (Open Container Initiative) compliant runtime that Docker and other container platforms use to spawn and manage containers. It focuses on demonstrating three core Linux kernel features essential for container isolation and resource management: Namespaces, Control Groups (cgroups), and `pivot_root`.
+`my-runc` is our simplified implementation of an OCI (Open Container Initiative) compliant runtime, analogous to `runc`. It directly interacts with the Linux kernel to create and manage isolated container environments.
 
-### Core Concepts Explained: The Building Blocks of Containers
+### Core Capabilities: Linux Kernel Primitives in Action
 
-To understand `my-runc`, we first need to grasp the foundational Linux kernel features it leverages. We will explain these concepts assuming zero prior knowledge of operating systems, diving deep into their mechanisms and how they contribute to containerization.
+`my-runc` leverages several key Linux kernel features to provide container isolation and resource management:
 
-#### 1. Linux Kernel Namespaces: The Isolation Mechanism
+*   **Linux Namespaces (Isolation):** Provides each container with its own isolated view of system resources. `my-runc` implements:
+    *   **PID Namespace:** Independent Process ID space.
+    *   **Mount Namespace:** Isolated filesystem hierarchy.
+    *   **UTS Namespace:** Independent hostname.
+    *   **IPC Namespace:** Isolated Inter-Process Communication.
+    *   **Network Namespace:** Isolated network stack (devices, IPs, routing).
+    *   **User Namespace:** Isolated User/Group IDs, allowing container `root` to map to an unprivileged host user for enhanced security.
+*   **Control Groups (Cgroups) (Resource Limits):** Manages and limits system resources (like CPU, memory, I/O) allocated to containers. `my-runc` supports both Cgroups v1 and v2, primarily demonstrating memory limiting.
+*   **`pivot_root` (Filesystem Isolation):** Securely changes the root filesystem of the container, completely detaching it from the host's filesystem.
 
-**What are Namespaces?**
+### Advanced Implementation Details
 
-In Linux, namespaces are a powerful feature that partitions global system resources such that processes within a namespace see an isolated instance of that resource. Imagine a large apartment building (the host system). Each apartment (a container) has its own set of amenities (process IDs, network interfaces, file system mounts, etc.), even though they all exist within the same physical building. Namespaces provide this "apartment" view to processes, preventing them from seeing or interfering with the resources of other "apartments" or the building management (the host system).
-
-**How do Namespaces Work?**
-
-When a new process is created, it inherits the namespaces of its parent. To create a container, we essentially tell the kernel to create new, isolated namespaces for the child process. This is achieved primarily through two Linux system calls: `unshare()` and `clone()`.
-
-*   **`unshare(CLONE_NEW* flags)`:** This syscall allows a process to disassociate parts of its execution context (like namespaces) from its parent. For example, `unshare(CLONE_NEWPID)` tells the kernel to move the calling process into a new PID namespace.
-*   **`clone(CLONE_NEW* flags, ...)`:** This syscall creates a new child process, similar to `fork()`, but with more control. By passing `CLONE_NEW*` flags, we can specify which new namespaces the child process should be created within. Our `my-runc` uses `clone()` implicitly via `os/exec.Cmd.SysProcAttr.Cloneflags` to create the child process in new namespaces.
-
-Let's explore the specific namespace types implemented in `my-runc`:
-
-*   **PID Namespace (`CLONE_NEWPID`): Process ID Isolation**
-    *   **What it does:** Isolates the process ID (PID) space. Inside a PID namespace, processes are assigned PIDs starting from 1, independent of the host's PID numbering. The first process in a new PID namespace gets PID 1, just like `init` or `systemd` on the host. This process becomes the "init" for that namespace and handles orphaned processes.
-    *   **Why it's crucial for containers:** Without PID isolation, a process inside a container might see and potentially kill host processes, or its PIDs would conflict with host PIDs, making process management impossible. PID 1 inside the container is critical for proper process supervision.
-
-*   **Mount Namespace (`CLONE_NEWNS`): Isolated Filesystem Views**
-    *   **What it does:** Isolates the list of mount points seen by processes. Each mount namespace has its own view of the filesystem hierarchy. Changes to mount points (e.g., mounting a new filesystem, unmounting) within one mount namespace are not visible in others.
-    *   **Why it's crucial for containers:** This is fundamental for providing a container with its own isolated root filesystem, preventing it from accessing or modifying the host's filesystem directly. This is often combined with `pivot_root`.
-
-*   **UTS Namespace (`CLONE_NEWUTS`): Isolated Hostname and Domainname**
-    *   **What it does:** Isolates the hostname and NIS (Network Information Service) domain name. Processes in different UTS namespaces can have different hostnames.
-    *   **Why it's crucial for containers:** Allows each container to have its own identity on the network (e.g., its own hostname) without affecting the host or other containers.
-
-*   **IPC Namespace (`CLONE_NEWIPC`): Isolated Inter-Process Communication**
-    *   **What it does:** Isolates inter-process communication (IPC) resources such as System V IPC objects (message queues, semaphores, shared memory segments) and POSIX message queues.
-    *   **Why it's crucial for containers:** Prevents processes in one container from interfering with IPC mechanisms used by other containers or the host, ensuring communication isolation.
-
-*   **Network Namespace (`CLONE_NEWNET`): Isolated Network Stack**
-    *   **What it does:** Provides an isolated network stack. This includes its own network devices (e.g., `lo`, `eth0`), IP addresses, routing tables, firewall rules, and port numbers.
-    *   **Why it's crucial for containers:** Each container can have its own virtual network interface, IP address, and port mappings, making it appear as a separate machine on the network. This allows multiple containers to run on the same host and bind to the same port numbers (e.g., port 80) without conflict.
-
-*   **User Namespace (`CLONE_NEWUSER`): Isolated User and Group IDs**
-    *   **What it does:** Isolates the user and group ID (UID/GID) space. This allows a process to have root privileges (UID 0) inside the container while being mapped to an unprivileged UID on the host.
-    *   **Why it's crucial for containers:** A critical security feature. It enables processes within a container to run as `root` for administrative tasks without actually having `root` privileges on the host system, significantly reducing the security blast radius if a container is compromised. Our `my-runc` uses UID/GID mapping to achieve this.
-
-#### 2. Linux Control Groups (cgroups): Resource Management
-
-**What are cgroups?**
-
-Control Groups (cgroups) are a Linux kernel feature that allows for the allocation, prioritization, and management of system resources (CPU, memory, disk I/O, network) among groups of processes. While namespaces isolate *what* a process can see, cgroups control *how much* resources a process (or a group of processes) can use.
-
-**How do cgroups Work? (Architecture)**
-
-Cgroups are organized hierarchically, similar to a filesystem. The kernel exposes a virtual filesystem (typically mounted at `/sys/fs/cgroup`) where directories represent cgroups and special files within those directories allow administrators to configure resource limits.
-
-*   **Hierarchy:** Cgroups form a tree structure. A child cgroup can further subdivide the resources allocated to its parent.
-*   **Subsystems:** Different resource types (CPU, memory, blkio, net_cls, etc.) are managed by different "subsystems."
-
-**Versioning: Cgroups v1 vs. Cgroups v2**
-
-Modern Linux kernels have moved to **Cgroups v2**, which offers a unified hierarchy for all resource controllers, unlike v1 which had separate hierarchies for memory, cpu, etc. `my-runc` is robust enough to detect and handle both versions.
-
-*   **Cgroups v1 Strategy:**
-    *   Checks for directory `/sys/fs/cgroup/memory`.
-    *   Creates a new cgroup directory: `/sys/fs/cgroup/memory/my-container`.
-    *   **Enabling:** Writes the process PID to `cgroup.procs`.
-    *   **Limiting:** Writes the limit in bytes to `memory.limit_in_bytes`.
-
-*   **Cgroups v2 Strategy:**
-    *   Checks for the unified hierarchy at `/sys/fs/cgroup` (where `memory.max` exists).
-    *   Creates a new cgroup directory: `/sys/fs/cgroup/my-container`.
-    *   **Enabling:** Writes the process PID to `cgroup.procs`.
-    *   **Limiting:** Writes the limit in bytes to `memory.max`.
-
-**Implementation Details (`setupCgroups`):**
-Our implementation in `namespace_linux.go` dynamically detects the cgroup version by checking for the existence of the `memory` controller directory. This ensures `my-runc` works on both older systems and modern distributions like Ubuntu 22.04+ (used in Lima VMs).
-
-#### 3. Root Filesystem Isolation (`pivot_root`): Changing the Container's View of the World
-
-**What is `pivot_root`?**
-
-`pivot_root` is a Linux system call that changes the root filesystem of the current process and all its children. Unlike `chroot()`, which only changes the root directory for a process and its children but doesn't fully detach the process from the old root filesystem, `pivot_root()` completely moves the current process's root from the old root to a new directory. The old root is then typically unmounted and becomes inaccessible to the process.
-
-**The `pivot_root` Dance (Detailed Implementation):**
-
-Performing `pivot_root` correctly requires a specific sequence of operations to satisfy kernel requirements (specifically, that the new root must be a mount point separate from the old root).
-
-1.  **Prepare the New Root Location:** We create a temporary directory `/tmp/my-runc-root` to serve as the staging area for our new root.
-2.  **Bind Mount the Root Filesystem:** We perform a bind mount of the desired root filesystem (in our simple case, the host's `/`) onto `/tmp/my-runc-root`. This effectively clones the filesystem view into that directory.
-    *   `syscall.Mount(rootfs, newRoot, "", syscall.MS_BIND|syscall.MS_REC, "")`
-3.  **Make it Private:** We mark this new mount as "private". This ensures that mount events within this new namespace don't propagate back to the host namespace.
-    *   `syscall.Mount(newRoot, newRoot, "", syscall.MS_PRIVATE|syscall.MS_REC, "")`
-4.  **Prepare the "Old Root" Holding Area:** We create a directory inside our new root, e.g., `/tmp/my-runc-root/.pivot_root`, to temporarily hold the old filesystem.
-5.  **Execute `pivot_root`:** We call the syscall.
-    *   `syscall.PivotRoot(newRoot, putOld)`
-    *   At this exact moment, `/tmp/my-runc-root` becomes `/`. The old `/` is moved to `/.pivot_root`.
-6.  **Switch Working Directory:** The process is technically still "standing" in the old directory structure. We explicitly `os.Chdir("/")` to move into the top of the new root.
-7.  **Unmount the Old Root:** We unmount `/.pivot_root` to sever the link to the host completely.
-    *   `syscall.Unmount("/.pivot_root", syscall.MNT_DETACH)`
-8.  **Mount `/proc`:** This is a critical final step. Process tools like `ps` rely on the `/proc` filesystem to list running processes. If we don't mount a fresh version of `/proc` inside our new root, `ps` will either fail or show the *host's* process list (breaking the illusion of isolation). We mount a new `proc` filesystem instance, which will only contain PIDs visible within our new PID namespace.
-
-### `my-runc` Architecture and Execution Flow
-
-`my-runc` is designed with a parent-child process model to achieve containerization.
-
-#### The `run` Command (Parent Process)
-
-When you execute `my-runc run <command> [args...]`, the initial `my-runc` process acts as the **parent**. Its primary responsibility is to:
-
-1.  Parse the user's command.
-2.  Create a new child process with all the desired Linux namespaces enabled.
-3.  Set up UID/GID mappings for the user namespace.
-4.  Wait for the child process to complete.
-
-**UID/GID Mapping Explained:**
-
-One of the most complex parts of User Namespaces is mapping. We want the user to be `root` (UID 0) inside the container, but a safe, unprivileged user (like UID 1000) outside.
-
-In `run_linux.go`, we define `UidMappings` and `GidMappings` in `syscall.SysProcAttr`:
-
-```go
-UidMappings: []syscall.SysProcIDMap{
-    {
-        ContainerID: 0,           // The UID inside the container (root)
-        HostID:      os.Getuid(), // The UID on the host (current user, e.g., 1000)
-        Size:        1,           // Map only this one ID
-    },
-},
-```
-
-*   **ContainerID: 0:** This tells the kernel "Inside the new namespace, this user is 0 (root)."
-*   **HostID: os.Getuid():** This tells the kernel "On the host, this maps to the actual user running the program."
-*   **Result:** When the child process starts, it thinks it is running as root. It can perform operations that require root *within the bounds of its namespace* (like mounting /proc), but it has no extra privileges on the actual host filesystem.
-
-#### The `child` Command (Child Process)
-
-After the parent process initiates the child with new namespaces, the child process starts executing the `my-runc` binary again, but this time it enters the `child` case in the `main` function's `switch` statement. This `child` process is now isolated within its own set of namespaces. Its responsibilities are:
-
-1.  **`setupCgroups()`**: Detects v1/v2 and applies memory limits (default 100MB).
-2.  **`setupRootFS()`**: Performs the bind-mount, `pivot_root`, and mounts `/proc`.
-3.  **`exec`**: Replaces itself with the user's command (e.g., `bash`).
-
-### Platform-Specific Implementation (Go Build Tags)
-
-Go build tags (also known as build constraints) allow us to include or exclude entire files from a package during compilation based on operating system, architecture, or custom tags. This is crucial for `my-runc` because many of the Linux kernel syscalls (like `pivot_root` or `CLONE_NEW*` flags) are not available or behave differently on other operating systems (e.g., macOS, Windows).
-
-*   **`//go:build linux`:** This tag at the top of a `.go` file means the file will *only* be compiled when the target operating system is Linux.
-*   **`//go:build !linux`:** This tag means the file will be compiled for *any* operating system *except* Linux.
+*   **The "Re-Execution" Pattern:** `my-runc` employs a sophisticated parent-child re-execution model. The main `my-runc` process launches itself again in a "child" mode within newly created namespaces. This child then performs internal setup (Cgroups, `pivot_root`) before executing the user's command.
+*   **Pipe Synchronization (Parent-Child IPC):** A critical aspect of the re-execution pattern is the use of a synchronization pipe. The parent process creates a pipe and passes its read-end to the child. The child performs internal setup, then blocks on this pipe. The parent, after launching the child, performs external setup (like network configuration) on the child's new namespaces, then signals the child via the pipe. This ensures precise ordering and prevents race conditions in the container's environment setup.
+*   **Functional Networking:** Unlike a "roadmap" item, `my-runc` includes a functional single-host bridge networking implementation. It uses `veth` pairs, bridge devices (`my-bridge0`), and `iptables` for NAT/masquerading, allowing containers to have their own IP addresses and reach the internet.
 
 ### Usage
 
-To run a command inside a `my-runc` container (on a Linux system):
+**Building the `my-runc` binary:**
 
+Navigate to the `my-runc` directory and run:
 ```bash
-sudo ./my-runc run <command> [args...]
+cd my-runc && go build -o my-runc .
 ```
 
-**Note:** `my-runc` often requires root privileges to perform syscalls like `unshare`, `pivot_root`, and cgroup manipulations.
+**Executing an isolated process with Networking:**
 
-Example: Run `hostname` inside a container. You should see a generic hostname like `my-runc-container` (if set) or the original hostname (if UTS namespace is not fully utilized) different from your host's hostname.
-
+This command demonstrates `my-runc`'s core capabilities:
 ```bash
-sudo ./my-runc run hostname
+# This command:
+# 1. Spawns a new process in a private PID/Net/Mount namespace.
+# 2. Automatically creates 'my-bridge0' on your host.
+# 3. Injects a virtual ethernet cable into the container.
+# 4. Sets up NAT so the container can reach the internet.
+sudo ./my-runc run --ip 10.244.0.100 sh -c "ip addr && ping -c 1 8.8.8.8"
 ```
 
-Example: Run a memory-intensive Python script to test cgroups. This should fail with an OOM (Out Of Memory) error if the memory limit is exceeded.
+**Other `my-runc` commands:**
 
-```bash
-sudo ./my-runc run python -c 'import time; x = bytearray(200000000); time.sleep(1)'
-```
-(Requires Python to be installed in the root filesystem used by the container)
-
-### Building
-
-To build the `my-runc` binary, navigate to the `my-runc` directory and run:
-
-```bash
-go build -o my-runc .
-```
+*   **`my-runc run <command>`:** Runs a command in an isolated environment (without networking by default).
+*   **`my-runc spec`:** (Placeholder) Generates a container specification.
+*   **`my-runc version`:** Displays `my-runc`'s version.
 
 ### Testing
 
-Comprehensive testing is crucial to ensure the correctness and robustness of `my-runc`, especially when dealing with low-level kernel interactions. We employ a strategy that combines unit tests for different platforms.
+Comprehensive tests validate `my-runc`'s Linux-specific features, including hostname, PID, and filesystem isolation, as well as cgroup memory limits.
 
-*   **Unit Tests (`run_test.go` and `run_linux_test.go`):**
-    *   `run_test.go`: Contains tests that verify the behavior of `my-runc` on non-Linux systems. It specifically checks that attempts to run containers on unsupported platforms result in the expected error message and exit code.
-    *   `run_linux_test.go`: Contains tests specifically for Linux systems. These tests verify:
-        *   **Hostname Isolation:** By running `hostname` inside the container and comparing it to the host's hostname, ensuring the UTS namespace is effectively isolating.
-        *   **PID Isolation:** Runs `ps aux` to confirm the container sees itself as PID 1 and cannot see host processes.
-        *   **Filesystem Isolation:** Verifies the `pivot_root` logic by checking if the old root is accessible.
-        *   **Cgroups Memory Limit:** By attempting to allocate more memory than allowed by the cgroup (using an infinite allocation loop), it verifies that the kernel's OOM killer terminates the process as expected.
-
-To run the tests, navigate to the `my-runc` directory and execute:
-
+To run tests (on a Linux system):
 ```bash
+cd my-runc
 sudo go test -v ./...
 ```
 
-*   **On non-Linux systems (e.g., macOS):** The `run_linux_test.go` file will be automatically skipped by the Go build system due to the `//go:build linux` tag. Only `run_test.go` (and any other untagged or `!linux` tagged tests) will run, confirming the unsupported behavior.
-*   **On Linux systems:** Both `run_test.go` (if present and relevant, though typically `!linux` tests would be skipped) and `run_linux_test.go` will be executed, validating the actual containerization features. (Note: The `python` command in the cgroups test must be available in the container's root filesystem).
-
 ### Running on macOS (via Lima)
 
-Since macOS uses the Darwin kernel, it does not support Linux namespaces or Cgroups. To develop and run `my-runc` on a Mac, we recommend using `limactl` (Lima) to run a lightweight Linux VM.
+Since macOS (Darwin kernel) does not support Linux namespaces or Cgroups, `my-runc` can be developed and run within a lightweight Linux VM using `limactl` (Lima).
 
 1.  **Start a Linux VM:** `limactl start ubuntu`
 2.  **Enter the VM:** `limactl shell ubuntu`
-3.  **Copy Code:** Due to read-only filesystem limitations with shared folders, copy the project to a local directory in the VM:
+3.  **Copy Code:** Copy the project to a local directory in the VM (shared folders can have limitations):
     ```bash
-    cp -r /path/to/my-runc ~/playground
-    cd ~/playground
+    cp -r /path/to/mini-kube/my-runc ~/my-runc-playground
+    cd ~/my-runc-playground
     ```
 4.  **Build and Run:**
     ```bash
@@ -222,52 +88,272 @@ Since macOS uses the Darwin kernel, it does not support Linux namespaces or Cgro
     sudo ./my-runc run bash
     ```
 
-## Part 2: `my-kube` - The Orchestrator (Work in Progress)
+---
 
-We are now building a simplified version of Kubernetes to manage our `my-runc` containers across multiple nodes. We call this the **Mini-Cloud Architecture**.
+## Part 2: `my-kube` - The Orchestrator
 
-### The Architecture: "Manager" vs. "Worker"
+`my-kube` is a **functional, albeit simplified, implementation of a Kubernetes-like orchestrator**. It manages `my-runc` containers across a simulated cluster, demonstrating the core principles of distributed systems and desired state reconciliation.
 
-To move beyond running single processes on a single machine, we will simulate a cluster using **3 Linux VMs** (managed by `limactl`).
+### Architecture: The Mini-Cloud ("Manager" vs. "Worker")
 
-#### 1. The Control Plane (`my-kube-server`) - The "Manager"
-*   **Location:** Runs on the `master-node` VM.
-*   **Role:** The Brain. It does not run user applications. It manages the state of the cluster.
-*   **Component: API Server (Go):**
-    *   A Go HTTP server listening on port 8080.
-    *   Accepts commands like `POST /pods` to create new work.
-    *   Stores the "Desired State" (e.g., "We need 2 web servers running").
-*   **Component: Scheduler:**
-    *   A loop that assigns "Pending" pods to available Worker Nodes based on RAM availability.
+The `my-kube` architecture simulates a cluster using a "Manager" (Control Plane) and "Worker" nodes.
 
-#### 2. The Worker Node (`my-kubelet`) - The "Kitchen"
-*   **Location:** Runs on `worker-node-1` and `worker-node-2`.
-*   **Role:** The Muscle. It executes the work assigned by the Manager.
-*   **Component: Kubelet (Go):**
-    *   An agent that constantly polls the API Server: *"Do you have work for me?"*
-    *   When it receives a job, it calls **`my-runc`** to spin up the container.
-    *   It monitors the container's health and reports back to the Master.
+*   **The Control Plane (`my-kube-server`) - The "Manager":**
+    *   **Role:** The brain of the cluster. It defines and maintains the "Desired State" of applications.
+    *   **Components:**
+        *   **API Server:** A Go HTTP server that stores the cluster's state (e.g., information about Pods, Nodes). It exposes endpoints for creating and querying resources.
+        *   **Scheduler:** A component that continuously watches for "Pending Pods" (desired workloads without assigned execution locations) and assigns them to available "Worker" nodes based on defined policies (e.g., resource availability).
+*   **The Worker Node (`my-kubelet`) - The "Kitchen":**
+    *   **Role:** The muscle of the cluster. It executes the workloads assigned by the Control Plane.
+    *   **Components:**
+        *   **Kubelet Agent:** An agent that runs on each worker node. It constantly polls the API Server to discover what Pods it should be running.
+        *   **`my-runc` Integration:** When assigned a Pod, the Kubelet calls `my-runc` to spin up the container locally. It then monitors the container's health and reports its status back to the API Server.
+*   **The Workload (The "App"):**
+    *   These are the actual user applications running inside `my-runc` containers on the worker nodes. `my-kube` is designed to orchestrate long-running services, such as simple HTTP servers, to demonstrate cluster networking.
 
-#### 3. The Workload (The "App")
-*   **Location:** Inside the containers on Worker Nodes.
-*   **Role:** The actual application useful to the user.
-*   **Implementation (Python HTTP Server):**
-    *   Instead of running `ls` (which exits immediately), we will run a lightweight Python Web Server (`python3 -m http.server`).
-    *   **Goal:** This server will listen on a specific IP address. If we can `curl` this IP from the Master Node and get a response, we have successfully implemented **Cluster Networking**.
+### Core Orchestration Principles
 
-### The Networking Challenge
+`my-kube` embodies the core Kubernetes principle of **Desired State vs. Actual State** reconciliation:
 
-This is the most complex part of Part 2. `ls` doesn't need network, but a Web Server does.
-*   **Bridge Networking:** We must implement a virtual network bridge (like `cni0`) on each worker.
-*   **IP Allocation:** Every container needs a unique IP address (e.g., `10.244.1.5`) reachable from other nodes.
+*   **Desired State:** What the user *wants* the cluster to look like (e.g., "I want 3 copies of Nginx running"). This state is stored in the API Server.
+*   **Actual State:** The current reality of the cluster (e.g., "Only 2 copies are running because one crashed").
+*   **Reconciliation Loop:** The Scheduler and Kubelet agents constantly observe both states. If they don't match, they take action to bring the Actual State in line with the Desired State (e.g., starting another Nginx instance). This makes the system **self-healing**.
 
-### Roadmap
+### Cluster Networking
 
-1.  **Infrastructure:** Script to spin up 3 connected `limactl` VMs.
-2.  **Networking Upgrade:** Modify `my-runc` to support network namespaces and veth pairs (Bridge Networking).
-3.  **The API Server:** Build the Go server to accept Pod requests.
-4.  **The Kubelet:** Build the agent to poll the server and run containers.
-5.  **Integration:** Deploy a Python Web Server pod and access it via `curl` from a different node.
+`my-kube` builds upon `my-runc`'s networking capabilities to enable communication between containers and nodes. This allows for the deployment of networked applications (like web servers) where components can reach each other across the cluster, a fundamental requirement for distributed applications.
+
+### Usage
+
+`my-kube` is designed to run across multiple Linux VMs (e.g., using Lima).
+
+*   **Start `my-kube-server`:**
+    ```bash
+    cd my-kube/server
+    go run main.go
+    ```
+*   **Start `my-kubelet` agent on worker nodes:**
+    ```bash
+    cd my-kube/agent
+    go run main.go --api-server-ip <SERVER_IP>
+    ```
+    (Note: Specific commands for deploying Pods via the API are not yet documented here but are handled by the server's API endpoints.)
+
+---
+
+## Multi-VM Cluster Setup: Running `my-kube` with `limactl`
+
+`my-kube` is designed to run in a distributed fashion across multiple nodes. We'll set up **3 Lima VMs**:
+*   **1 Control Plane Node (master-node):** Will run `my-kube-server`.
+*   **2 Worker Nodes (worker-node-1, worker-node-2):** Will run `my-kubelet` agents.
+
+This setup simulates a small Kubernetes cluster.
+
+---
+
+**Step 0: Prepare Your Host Machine (One-time setup)**
+
+Make sure `limactl` is installed and working. You should also ensure you have a `mini-kube` directory on your host that contains all the `my-runc` and `my-kube` code.
+
+---
+
+**Step 1: Create and Start Lima VMs**
+
+We'll create three Ubuntu VMs. For `my-kube` networking, it's essential that these VMs can communicate. Lima's default networking often suffices for VMs on the same host.
+
+1.  **Create `master-node` (1 CPU, 1GiB RAM, 10GiB Disk):**
+    ```bash
+    limactl create --name master-node --memory=1 --cpus=1 --disk=10
+    ```
+2.  **Create `worker-node-1` (1 CPU, 1GiB RAM, 10GiB Disk):**
+    ```bash
+    limactl create --name worker-node-1 --memory=1 --cpus=1 --disk=10
+    ```
+3.  **Create `worker-node-2` (1 CPU, 1GiB RAM, 10GiB Disk):**
+    ```bash
+    limactl create --name worker-node-2 --memory=1 --cpus=1 --disk=10
+    ```
+    *Reminder:* After each `limactl create` command, Lima might open a text editor with the configuration YAML. Just save and close the editor (e.g., `esc`, then `:wq`, then `Enter` for `vi`; `Ctrl+X`, then `Y` to save, then `Enter` for `nano`) to apply the settings.
+
+4.  **Start all VMs:**
+    ```bash
+    limactl start master-node
+    limactl start worker-node-1
+    limactl start worker-node-2
+    ```
+    *Wait for all VMs to fully boot. You can check their status with `limactl list`.*
+
+---
+
+**Step 2: Build and Distribute `my-runc` and `my-kube` Binaries**
+
+We need `my-runc` on worker nodes (because `my-kubelet` calls it) and `my-kube-server` on the master, and `my-kubelet` on workers. It's easiest to build all binaries once on your host and then copy them.
+
+1.  **Build all binaries on your host:**
+    ```bash
+    # From your host's /Users/mihir/git/mini-kube directory
+    cd my-runc && go build -o my-runc . && cd ../..
+    cd my-kube/server && go build -o my-kube-server . && cd ../..
+    cd my-kube/agent && go build -o my-kubelet . && cd ../..
+    ```
+    You should now have `my-runc`, `my-kube-server`, and `my-kubelet` executables in their respective directories on your host.
+
+2.  **Copy `my-kube-server` to `master-node`:**
+    ```bash
+    limactl cp my-kube/server/my-kube-server master-node:~/my-kube-server
+    ```
+    *(You don't strictly need `my-runc` or `my-kubelet` on the master, but no harm in copying if you want a complete set).*
+
+3.  **Copy binaries to `worker-node-1`:**
+    ```bash
+    limactl cp my-runc/my-runc worker-node-1:~/my-runc
+    limactl cp my-kube/agent/my-kubelet worker-node-1:~/my-kubelet
+    ```
+
+4.  **Copy binaries to `worker-node-2`:**
+    ```bash
+    limactl cp my-runc/my-runc worker-node-2:~/my-runc
+    limactl cp my-kube/agent/my-kubelet worker-node-2:~/my-kubelet
+    ```
+
+---
+
+**Step 3: Get the `master-node` IP Address**
+
+You'll need the IP address of your `master-node` for the worker agents to connect to.
+
+1.  **Shell into `master-node`:**
+    ```bash
+    limactl shell master-node
+    ```
+2.  **Get IP address:**
+    ```bash
+    ip a | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | cut -d/ -f1
+    ```
+    *Note down this IP address (e.g., `192.168.5.15`). You will use it as `<MASTER_IP>`.*
+3.  **Exit `master-node` shell:**
+    ```bash
+    exit
+    ```
+
+---
+
+**Step 4: Start the Control Plane (`my-kube-server`) on `master-node`**
+
+1.  **Shell into `master-node`:**
+    ```bash
+    limactl shell master-node
+    ```
+2.  **Run `my-kube-server`:**
+    ```bash
+    ~/my-kube-server &
+    ```
+    *This will start the API server and scheduler. You should see output like "Starting my-kube-server (Control Plane)..." and "Listening on :8080...". The `&` puts it in the background so you can still use the terminal. You can safely `exit` this shell after this, or keep it open to see logs.*
+
+---
+
+**Step 5: Start Worker Agents (`my-kubelet`) on `worker-node-1` and `worker-node-2`**
+
+You need to tell each worker where to find the `my-kube-server`.
+
+1.  **Shell into `worker-node-1`:**
+    ```bash
+    limactl shell worker-node-1
+    ```
+2.  **Run `my-kubelet`:** (Replace `<MASTER_IP>` with the IP you got in Step 3).
+    ```bash
+    ~/my-kubelet --api-server-ip http://<MASTER_IP>:8080 --node-id worker-node-1 &
+    ```
+    *You should see output indicating registration and sync loops. The `--node-id` should match the VM name.*
+
+3.  **Exit `worker-node-1` shell:**
+    ```bash
+    exit
+    ```
+
+4.  **Shell into `worker-node-2`:**
+    ```bash
+    limactl shell worker-node-2
+    ```
+5.  **Run `my-kubelet`:** (Replace `<MASTER_IP>` again).
+    ```bash
+    ~/my-kubelet --api-server-ip http://<MASTER_IP>:8080 --node-id worker-node-2 &
+    ```
+6.  **Exit `worker-node-2` shell:**
+    ```bash
+    exit
+    ```
+
+*At this point, your `my-kube-server` on `master-node` should be receiving registration requests from `worker-node-1` and `worker-node-2` and they should be visible in its logs. You can re-shell into `master-node` to check `~/my-kube-server` logs.*
+
+---
+
+**Step 6: Deploy a Sample Workload (Python HTTP Server) via the API**
+
+`my-kube` uses its API server to receive workload requests. You'll make a `curl` request to the master-node to create a Pod. This pod will run a simple Python HTTP server within a `my-runc` container.
+
+1.  **From your host machine's terminal**, prepare a JSON file for your pod (e.g., `pod.json`):
+    ```json
+    {
+      "id": "my-web-server",
+      "name": "my-web-server-pod",
+      "command": ["python3", "-m", "http.server", "8000"],
+      "status": "Pending"
+    }
+    ```
+    *Save this as `pod.json` in your host's `mini-kube` directory.*
+
+2.  **Deploy the pod:** (Replace `<MASTER_IP>` with the IP you got in Step 3).
+    ```bash
+    curl -X POST -H "Content-Type: application/json" -d @pod.json http://<MASTER_IP>:8080/pods
+    ```
+    *You should receive a JSON response confirming the pod creation. The `my-kube-server` logs on `master-node` should show the pod being created and then assigned to a worker by the scheduler.*
+    *The worker node logs (e.g., on `worker-node-1`) should show `my-kubelet` detecting the new pod and calling `my-runc` to start it.*
+    *Crucially, `python3` needs to be available in the container's root filesystem (i.e., the default rootfs that `my-runc` is using) for this command to work inside the container.*
+
+---
+
+**Step 7: Verify the Workload**
+
+Once the pod is running, you can try to access the Python HTTP server.
+
+1.  **Find the `PodIP` and assigned `NodeID`:**
+    You can `curl` the master's API server again to get the updated status of your pod.
+    ```bash
+    curl http://<MASTER_IP>:8080/pods
+    ```
+    *Look for your `my-web-server` pod. It should now have a `NodeID` (e.g., `worker-node-1`) and a `PodIP` (e.g., `10.244.0.100`).*
+
+2.  **Access the web server:**
+    *   If the pod was assigned to `worker-node-1`, you'll need the IP address of `worker-node-1`. You can get this like in Step 3, by running `limactl shell worker-node-1` then `ip a`.
+    *   From your **host machine**, try to `curl` the worker node's IP on port 8000 (assuming port forwarding is correctly set up by your Lima VM networking, or if `my-runc` configured `iptables` for external access, which it currently does not).
+
+    *Simpler verification*: Log into the worker node that runs the pod, and check if the python server process is running. Also, try to `curl` the `PodIP` from *within* the worker node itself.
+
+    ```bash
+    # On your host
+    limactl shell <NODE_ID_WHERE_POD_IS_RUNNING>
+    # Inside the worker VM
+    curl http://<POD_IP>:8000
+    # You should see HTML output from the Python server.
+    ```
+
+---
+
+**Step 8: Clean Up**
+
+When you're done, clean up your Lima VMs.
+
+1.  **Stop all VMs:**
+    ```bash
+    limactl stop master-node worker-node-1 worker-node-2
+    ```
+2.  **Delete all VMs:**
+    ```bash
+    limactl delete master-node worker-node-1 worker-node-2
+    ```
+
+---
 
 ## Development Notes
 
