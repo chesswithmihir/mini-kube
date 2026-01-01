@@ -38,9 +38,9 @@ This project aims to **demystify the "magic" of Docker and Kubernetes** by build
 
 **Building the `my-runc` binary:**
 
-Navigate to the `my-runc` directory and run:
+Navigate to the root directory and run:
 ```bash
-cd my-runc && go build -o my-runc .
+make my-runc
 ```
 
 **Executing an isolated process with Networking:**
@@ -52,23 +52,27 @@ This command demonstrates `my-runc`'s core capabilities:
 # 2. Automatically creates 'my-bridge0' on your host.
 # 3. Injects a virtual ethernet cable into the container.
 # 4. Sets up NAT so the container can reach the internet.
-sudo ./my-runc run --ip 10.244.0.100 sh -c "ip addr && ping -c 1 8.8.8.8"
+sudo ./bin/my-runc run --ip 10.244.0.100 sh -c "ip addr && ping -c 1 8.8.8.8"
 ```
 
 **Other `my-runc` commands:**
 
-*   **`my-runc run <command>`:** Runs a command in an isolated environment (without networking by default).
-*   **`my-runc spec`:** (Placeholder) Generates a container specification.
-*   **`my-runc version`:** Displays `my-runc`'s version.
+*   **`./bin/my-runc run <command>`:** Runs a command in an isolated environment (without networking by default).
+*   **`./bin/my-runc spec`:** (Placeholder) Generates a container specification.
+*   **`./bin/my-runc version`:** Displays `my-runc`'s version.
 
 ### Testing
 
 Comprehensive tests validate `my-runc`'s Linux-specific features, including hostname, PID, and filesystem isolation, as well as cgroup memory limits.
 
-To run tests (on a Linux system):
+To run unit tests:
 ```bash
-cd my-runc
-sudo go test -v ./...
+make test
+```
+
+To run the full system End-to-End suite (which mocks the runtime):
+```bash
+make test-e2e
 ```
 
 ### Running on macOS (via Lima)
@@ -143,215 +147,145 @@ The `my-kube` architecture simulates a cluster using a "Manager" (Control Plane)
 
 ## Multi-VM Cluster Setup: Running `my-kube` with `limactl`
 
-`my-kube` is designed to run in a distributed fashion across multiple nodes. We'll set up **3 Lima VMs**:
-*   **1 Control Plane Node (master-node):** Will run `my-kube-server`.
-*   **2 Worker Nodes (worker-node-1, worker-node-2):** Will run `my-kubelet` agents.
-
-This setup simulates a small Kubernetes cluster.
+`my-kube` is designed to run in a distributed fashion across multiple nodes. To achieve this on macOS, we use **Lima** with a shared network bridge (`socket_vmnet`) to allow VMs to communicate.
 
 ---
 
 **Step 0: Prepare Your Host Machine (One-time setup)**
 
-Make sure `limactl` is installed and working. You should also ensure you have a `mini-kube` directory on your host that contains all the `my-runc` and `my-kube` code.
+1.  **Install Prerequisites:**
+    ```bash
+    brew install lima socket_vmnet
+    ```
+
+2.  **Configure `socket_vmnet` (Requires sudo):**
+    ```bash
+    sudo cp "$(brew --prefix socket_vmnet)/bin/socket_vmnet" /opt/socket_vmnet/bin/socket_vmnet
+    limactl sudoers | sudo tee /etc/sudoers.d/lima
+    ```
+
+3.  **Clean up stale sockets (if any):**
+    ```bash
+    sudo rm -f /private/var/run/lima/socket_vmnet.shared
+    ```
 
 ---
 
 **Step 1: Create and Start Lima VMs**
 
-We'll create three Ubuntu VMs. For `my-kube` networking, it's essential that these VMs can communicate. Lima's default networking often suffices for VMs on the same host.
+We'll use a specific configuration (`cluster-vm.yaml`) to enable the shared network.
 
-1.  **Create `master-node` (1 CPU, 1GiB RAM, 10GiB Disk):**
-    ```bash
-    limactl create --name master-node --memory=1 --cpus=1 --disk=10
-    ```
-2.  **Create `worker-node-1` (1 CPU, 1GiB RAM, 10GiB Disk):**
-    ```bash
-    limactl create --name worker-node-1 --memory=1 --cpus=1 --disk=10
-    ```
-3.  **Create `worker-node-2` (1 CPU, 1GiB RAM, 10GiB Disk):**
-    ```bash
-    limactl create --name worker-node-2 --memory=1 --cpus=1 --disk=10
-    ```
-    *Reminder:* After each `limactl create` command, Lima might open a text editor with the configuration YAML. Just save and close the editor (e.g., `esc`, then `:wq`, then `Enter` for `vi`; `Ctrl+X`, then `Y` to save, then `Enter` for `nano`) to apply the settings.
-
-4.  **Start all VMs:**
-    ```bash
-    limactl start master-node
-    limactl start worker-node-1
-    limactl start worker-node-2
-    ```
-    You can check their status with `limactl list`.
-
----
-
-**Step 2: Build and Distribute `my-runc` and `my-kube` Binaries**
-
-We need `my-runc` on worker nodes (because `my-kubelet` calls it) and `my-kube-server` on the master, and `my-kubelet` on workers. It's easiest to build all binaries once on your host and then copy them.
-
-1.  **Build all binaries on your host:**
-    ```bash
-    # From your host's /Users/mihir/git/mini-kube directory
-    cd my-runc && go build -o my-runc . && cd ../..
-    cd my-kube/server && go build -o my-kube-server . && cd ../..
-    cd my-kube/agent && go build -o my-kubelet . && cd ../..
-    ```
-    You should now have `my-runc`, `my-kube-server`, and `my-kubelet` executables in their respective directories on your host.
-
-2.  **Copy `my-kube-server` to `master-node`:**
-    ```bash
-    limactl cp my-kube/server/my-kube-server master-node:~/my-kube-server
-    ```
-    *(You don't strictly need `my-runc` or `my-kubelet` on the master, but no harm in copying if you want a complete set).*
-
-3.  **Copy binaries to `worker-node-1`:**
-    ```bash
-    limactl cp my-runc/my-runc worker-node-1:~/my-runc
-    limactl cp my-kube/agent/my-kubelet worker-node-1:~/my-kubelet
+1.  **Create `cluster-vm.yaml`:**
+    ```yaml
+    vmType: "vz"
+    cpus: 1
+    memory: "1GiB"
+    disk: "10GiB"
+    mounts:
+      - location: "~"
+        writable: true
+    networks:
+      - lima: shared
+    images:
+    - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+      arch: "x86_64"
+    - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+      arch: "aarch64"
     ```
 
-4.  **Copy binaries to `worker-node-2`:**
+2.  **Create and Start VMs:**
     ```bash
-    limactl cp my-runc/my-runc worker-node-2:~/my-runc
-    limactl cp my-kube/agent/my-kubelet worker-node-2:~/my-kubelet
+    limactl create --name master-node cluster-vm.yaml
+    limactl create --name worker-node-1 cluster-vm.yaml
+    limactl create --name worker-node-2 cluster-vm.yaml
+    
+    limactl start master-node worker-node-1 worker-node-2
     ```
 
 ---
 
-**Step 3: Get the `master-node` IP Address**
+**Step 2: Build and Distribute Binaries**
 
-You'll need the IP address of your `master-node` for the worker agents to connect to.
+Since we are on macOS but targeting Linux VMs, we must **cross-compile**. The binaries will be available to the VMs via the shared mount.
 
-1.  **Shell into `master-node`:**
+1.  **Build for Linux:**
+    ```bash
+    GOOS=linux GOARCH=arm64 make all
+    ```
+
+---
+
+**Step 3: Get the Cluster IPs**
+
+Verify that all nodes are on the `192.168.105.x` network.
+
+1.  **Check IP on Master:**
+    ```bash
+    limactl shell master-node ip a show lima0
+    ```
+    *(Note this IP, e.g., `192.168.105.2`).*
+
+---
+
+**Step 4: Start the Cluster**
+
+Open 3 terminal tabs.
+
+1.  **Terminal 1 (Master Node):**
     ```bash
     limactl shell master-node
-    ```
-2.  **Get IP address:**
-    ```bash
-    ip a | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | cut -d/ -f1
-    ```
-    *Note down this IP address (e.g., `192.168.5.15`). You will use it as `<MASTER_IP>`.*
-3.  **Exit `master-node` shell:**
-    ```bash
-    exit
+    cd /path/to/mini-kube
+    ./bin/my-kube-server --port 8080
     ```
 
----
-
-**Step 4: Start the Control Plane (`my-kube-server`) on `master-node`**
-
-1.  **Shell into `master-node`:**
-    ```bash
-    limactl shell master-node
-    ```
-2.  **Run `my-kube-server`:**
-    ```bash
-    ~/my-kube-server &
-    ```
-    *This will start the API server and scheduler. You should see output like "Starting my-kube-server (Control Plane)..." and "Listening on :8080...". The `&` puts it in the background so you can still use the terminal. You can safely `exit` this shell after this, or keep it open to see logs.*
-
----
-
-**Step 5: Start Worker Agents (`my-kubelet`) on `worker-node-1` and `worker-node-2`**
-
-You need to tell each worker where to find the `my-kube-server`.
-
-1.  **Shell into `worker-node-1`:**
+2.  **Terminal 2 (Worker 1):**
     ```bash
     limactl shell worker-node-1
-    ```
-2.  **Run `my-kubelet`:** (Replace `<MASTER_IP>` with the IP you got in Step 3).
-    ```bash
-    ~/my-kubelet --api-server-ip http://<MASTER_IP>:8080 --node-id worker-node-1 &
-    ```
-    *You should see output indicating registration and sync loops. The `--node-id` should match the VM name.*
-
-3.  **Exit `worker-node-1` shell:**
-    ```bash
-    exit
+    cd /path/to/mini-kube
+    sudo ./bin/my-kubelet --node worker-node-1 --server http://192.168.105.2:8080 --runc ./bin/my-runc
     ```
 
-4.  **Shell into `worker-node-2`:**
+3.  **Terminal 3 (Worker 2):**
     ```bash
     limactl shell worker-node-2
+    cd /path/to/mini-kube
+    sudo ./bin/my-kubelet --node worker-node-2 --server http://192.168.105.2:8080 --runc ./bin/my-runc
     ```
-5.  **Run `my-kubelet`:** (Replace `<MASTER_IP>` again).
-    ```bash
-    ~/my-kubelet --api-server-ip http://<MASTER_IP>:8080 --node-id worker-node-2 &
-    ```
-6.  **Exit `worker-node-2` shell:**
-    ```bash
-    exit
-    ```
-
-*At this point, your `my-kube-server` on `master-node` should be receiving registration requests from `worker-node-1` and `worker-node-2` and they should be visible in its logs. You can re-shell into `master-node` to check `~/my-kube-server` logs.*
 
 ---
 
-**Step 6: Deploy a Sample Workload (Python HTTP Server) via the API**
+**Step 5: Deploy and Verify a Workload**
 
-`my-kube` uses its API server to receive workload requests. You'll make a `curl` request to the master-node to create a Pod. This pod will run a simple Python HTTP server within a `my-runc` container.
-
-1.  **From your host machine's terminal**, prepare a JSON file for your pod (e.g., `pod.json`):
+1.  **Prepare `pod.json`:**
     ```json
     {
       "id": "my-web-server",
       "name": "my-web-server-pod",
       "command": ["python3", "-m", "http.server", "8000"],
+      "pod_ip": "10.244.0.100",
       "status": "Pending"
     }
     ```
-    *Save this as `pod.json` in your host's `mini-kube` directory.*
 
-2.  **Deploy the pod:** (Replace `<MASTER_IP>` with the IP you got in Step 3).
+2.  **Submit Pod:**
     ```bash
-    curl -X POST -H "Content-Type: application/json" -d @pod.json http://<MASTER_IP>:8080/pods
+    limactl shell master-node curl -X POST -H "Content-Type: application/json" -d @pod.json http://localhost:8080/pods
     ```
-    *You should receive a JSON response confirming the pod creation. The `my-kube-server` logs on `master-node` should show the pod being created and then assigned to a worker by the scheduler.*
-    *The worker node logs (e.g., on `worker-node-1`) should show `my-kubelet` detecting the new pod and calling `my-runc` to start it.*
-    *Crucially, `python3` needs to be available in the container's root filesystem (i.e., the default rootfs that `my-runc` is using) for this command to work inside the container.*
 
----
-
-**Step 7: Verify the Workload**
-
-Once the pod is running, you can try to access the Python HTTP server.
-
-1.  **Find the `PodIP` and assigned `NodeID`:**
-    You can `curl` the master's API server again to get the updated status of your pod.
+3.  **Verify Reachability:**
+    From the worker node, curl the container IP:
     ```bash
-    curl http://<MASTER_IP>:8080/pods
-    ```
-    *Look for your `my-web-server` pod. It should now have a `NodeID` (e.g., `worker-node-1`) and a `PodIP` (e.g., `10.244.0.100`).*
-
-2.  **Access the web server:**
-    *   If the pod was assigned to `worker-node-1`, you'll need the IP address of `worker-node-1`. You can get this like in Step 3, by running `limactl shell worker-node-1` then `ip a`.
-    *   From your **host machine**, try to `curl` the worker node's IP on port 8000 (assuming port forwarding is correctly set up by your Lima VM networking, or if `my-runc` configured `iptables` for external access, which it currently does not).
-
-    *Simpler verification*: Log into the worker node that runs the pod, and check if the python server process is running. Also, try to `curl` the `PodIP` from *within* the worker node itself.
-
-    ```bash
-    # On your host
-    limactl shell <NODE_ID_WHERE_POD_IS_RUNNING>
-    # Inside the worker VM
-    curl http://<POD_IP>:8000
-    # You should see HTML output from the Python server.
+    limactl shell worker-node-1 curl -I http://10.244.0.100:8000
     ```
 
 ---
 
-**Step 8: Clean Up**
+**Step 6: Clean Up**
 
-When you're done, clean up your Lima VMs.
-
-1.  **Stop all VMs:**
-    ```bash
-    limactl stop master-node worker-node-1 worker-node-2
-    ```
-2.  **Delete all VMs:**
-    ```bash
-    limactl delete master-node worker-node-1 worker-node-2
-    ```
+```bash
+limactl stop master-node worker-node-1 worker-node-2
+limactl delete master-node worker-node-1 worker-node-2
+```
 
 ---
 

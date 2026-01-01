@@ -31,9 +31,13 @@
     *   [4.1 The API Server: Concurrency & The Memory Store](#41-the-api-server-concurrency--the-memory-store)
     *   [4.2 The Scheduler: The Logic of Placement](#42-the-scheduler-the-logic-of-placement)
     *   [4.3 The Kubelet Agent: Edge-Triggered Reconciliation](#43-the-kubelet-agent-edge-triggered-reconciliation)
-6.  [Chapter 5: The Debugging Chronicles (Post-Mortems)](#chapter-5-the-debugging-chronicles-post-mortems)
-    *   [5.1 Case Study: The Nexthop/Subnet Failure](#51-case-study-the-nexthopsubnet-failure)
-    *   [5.2 Case Study: The 8.8.8.8 Packet Loss](#52-case-study-the-8888-packet-loss)
+6.  [Chapter 5: Infrastructure & Testing (The Engineering Backbone)](#chapter-5-infrastructure--testing-the-engineering-backbone)
+    *   [5.1 The Build System: Makefiles & Cross-Compilation](#51-the-build-system-makefiles--cross-compilation)
+    *   [5.2 End-to-End Testing: Mocking the Runtime](#52-end-to-end-testing-mocking-the-runtime)
+    *   [5.3 Virtualization Architecture: The "Split-Brain" Network Problem](#53-virtualization-architecture-the-split-brain-network-problem)
+7.  [Chapter 6: The Debugging Chronicles (Post-Mortems)](#chapter-6-the-debugging-chronicles-post-mortems)
+    *   [6.1 Case Study: The Nexthop/Subnet Failure](#61-case-study-the-nexthopsubnet-failure)
+    *   [6.2 Case Study: The 8.8.8.8 Packet Loss](#62-case-study-the-8888-packet-loss)
 
 ---
 
@@ -52,7 +56,7 @@ We believe that Kubernetes is often treated as a "mysterious cloud engine." This
 
 **Building the binary:**
 ```bash
-cd my-runc && go build -o my-runc .
+make my-runc
 ```
 
 **Executing an isolated process with Networking:**
@@ -62,7 +66,7 @@ cd my-runc && go build -o my-runc .
 # 2. Automatically creates 'my-bridge0' on your host.
 # 3. Injects a virtual ethernet cable into the container.
 # 4. Sets up NAT so the container can reach the internet.
-sudo ./my-runc run --ip 10.244.0.100 sh -c "ip addr && ping -c 1 8.8.8.8"
+sudo ./bin/my-runc run --ip 10.244.0.100 sh -c "ip addr && ping -c 1 8.8.8.8"
 ```
 
 ---
@@ -660,7 +664,52 @@ This loop is **Self-Healing**. If you manually kill Pod B, the Kubelet will noti
 
 ---
 
-## Chapter 5: The Debugging Chronicles (Post-Mortems)
+## Chapter 5: Infrastructure & Testing (The Engineering Backbone)
+
+As we moved from a toy project to a functional system, we introduced robust engineering practices.
+
+### 5.1 The Build System: Makefiles & Cross-Compilation
+
+We replaced manual `go build` commands with a recursive **Makefile** system. 
+*   **Root Makefile:** Orchestrates the entire project (`make all`, `make test`).
+*   **Component Makefiles:** Each component (`my-runc`, `my-kube`) has its own Makefile responsible for building its specific binaries into the shared `bin/` directory.
+
+**Cross-Compilation Challenge:**
+When developing on macOS (`darwin/arm64`) but targeting Linux VMs (`linux/arm64`), we utilize Go's built-in cross-compilation support by exporting environment variables in our build commands:
+`GOOS=linux GOARCH=arm64 make all`
+
+### 5.2 End-to-End Testing: Mocking the Runtime
+
+To test `my-kube`'s orchestration logic without needing a Linux kernel (e.g., on a Mac CI/CD runner), we implemented an **End-to-End (E2E) Test Suite**.
+
+*   **The Mock Runtime (`mock-runc.sh`):** Instead of calling the real `my-runc` (which requires `clone` and `namespaces`), we inject a shell script that mimics the runtime's interface (`run <cmd>`). This script logs its invocations to a file.
+*   **Integration Test (`e2e_test.go`):**
+    1.  Compiles the actual `my-kube-server` and `my-kubelet`.
+    2.  Spins them up on localhost ports.
+    3.  Submits a Pod via the API.
+    4.  Verifies the "Mock Runtime" log file to confirm the Kubelet received the instruction and "executed" the container.
+
+This decouples the **logic of orchestration** from the **mechanics of containerization**.
+
+### 5.3 Virtualization Architecture: The "Split-Brain" Network Problem
+
+Running a cluster on macOS using Lima VMs introduced a classic distributed systems problem: **Network Isolation**.
+
+**The Problem:**
+By default, Lima VMs using `vz` (Virtualization.framework) or `qemu` (user-mode networking) sit behind a NAT. They can reach the internet, but **they cannot reach each other**.
+*   Master Node thinks its IP is `192.168.5.15`.
+*   Worker Node thinks *its* IP is also `192.168.5.15`.
+*   They are in parallel, isolated network namespaces provided by the host.
+
+**The Solution: Shared Bridged Networking (`socket_vmnet`)**
+To create a true cluster, we utilized `socket_vmnet` to create a shared bridge on the host. This puts all VMs on the same virtual subnet (`192.168.105.x`), allowing:
+1.  **Unique IPs:** Master gets `.2`, Worker gets `.3`.
+2.  **Inter-Node Communication:** Workers can dial the Master's API.
+3.  **Host-to-VM Communication:** We can curl the Master's API from the host.
+
+---
+
+## Chapter 6: The Debugging Chronicles (Post-Mortems)
 
 ### 5.1 Case Study: The Nexthop/Subnet Failure
 
