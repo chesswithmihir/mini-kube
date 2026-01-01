@@ -1,0 +1,9 @@
+vmType: "vz"
+cpus: 1
+memory: "1GiB"
+disk: "10GiB"
+mounts:
+  - location: "~"
+    writable: true
+networks:
+  - lima: shared

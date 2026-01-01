@@ -1,0 +1,14 @@
+vmType: "vz"
+cpus: 1
+memory: "1GiB"
+disk: "10GiB"
+mounts:
+  - location: "~"
+    writable: true
+networks:
+  - lima: shared
+images:
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+  arch: "aarch64"

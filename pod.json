@@ -1,0 +1,7 @@
+{
+  "id": "my-web-server-v2",
+  "name": "my-web-server-pod",
+  "command": ["python3", "-m", "http.server", "8000"],
+  "pod_ip": "10.244.0.100",
+  "status": "Pending"
+}
