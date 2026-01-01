@@ -1,5 +1,8 @@
 # Makefile for my-runc project
 
+BIN_DIR := ../bin
+BINARY := $(BIN_DIR)/my-runc
+
 # Default target
 all: test
 
@@ -9,11 +12,12 @@ test:
 
 # Build the project
 build:
-	go build -o my-runc .
+	@mkdir -p $(BIN_DIR)
+	go build -o $(BINARY) .
 
 # Clean build artifacts
 clean:
-	rm -f my-runc
+	rm -f $(BINARY)
 
 # Run tests with coverage
 test-cover:
