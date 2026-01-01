@@ -181,7 +181,7 @@ We'll create three Ubuntu VMs. For `my-kube` networking, it's essential that the
     limactl start worker-node-1
     limactl start worker-node-2
     ```
-    *Wait for all VMs to fully boot. You can check their status with `limactl list`.*
+    You can check their status with `limactl list`.
 
 ---
 
