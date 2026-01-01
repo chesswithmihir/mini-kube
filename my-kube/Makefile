@@ -4,7 +4,7 @@ BIN_DIR := ../bin
 SERVER_BIN := $(BIN_DIR)/my-kube-server
 AGENT_BIN := $(BIN_DIR)/my-kubelet
 
-.PHONY: all build clean test server agent
+.PHONY: all build clean test server agent test-e2e
 
 all: build
 
@@ -20,6 +20,9 @@ agent:
 
 test:
 	go test -v ./...
+
+test-e2e:
+	go test -v -tags=e2e ./e2e/...
 
 clean:
 	rm -f $(SERVER_BIN) $(AGENT_BIN)

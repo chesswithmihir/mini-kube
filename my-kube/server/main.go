@@ -1,49 +1,29 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
-	"time"
 
-	"my-kube/pkg/api"
 	"my-kube/pkg/server"
 )
 
 func main() {
-	fmt.Println("Starting my-kube-server (Control Plane)...")
+	port := flag.Int("port", 8080, "Port to listen on")
+	flag.Parse()
+
+	fmt.Printf("Starting my-kube-server (Control Plane) on port %d...\n", *port)
 
 	store := server.NewMemoryStore()
 	apiServer := server.NewAPIServer(store)
 
 	// Start Scheduler in background
-	go runScheduler(store)
+	scheduler := server.NewScheduler(store)
+	go scheduler.Run()
 
 	// Start HTTP Server
-	fmt.Println("Listening on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", apiServer)) // ServeHTTP method makes it a Handler
-}
-
-func runScheduler(s server.Store) {
-	for {
-		time.Sleep(5 * time.Second)
-		
-pods := s.ListPods()
-nodes := s.ListNodes()
-		
-		if len(nodes) == 0 {
-			continue
-		}
-
-		for _, pod := range pods {
-			if pod.NodeID == "" && pod.Status == api.PodPending {
-				// Round-robin or random? 
-				// Dumbest scheduler ever: Always pick the first node
-				node := nodes[0]
-				
-				fmt.Printf("Scheduler: Assigning pod %s to node %s\n", pod.ID, node.ID)
-				s.AssignPodToNode(pod.ID, node.ID)
-			}
-		}
-	}
+	addr := fmt.Sprintf(":%d", *port)
+	fmt.Printf("Listening on %s...\n", addr)
+	log.Fatal(http.ListenAndServe(addr, apiServer)) // ServeHTTP method makes it a Handler
 }
